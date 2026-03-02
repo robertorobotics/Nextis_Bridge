@@ -1,47 +1,47 @@
 arms:
   aira_zero:
+    name: Aira Zero Follower
+    role: follower
+    motor_type: damiao
+    port: can0
+    enabled: true
+    structural_design: damiao_7dof
     config:
       home_position:
-        base: -0.01697566186007471
-        gripper: 0.5186160067139713
-        link1: -0.994697489890898
-        link2: -1.1324101625085827
-        link3: -0.9512092774853134
-        link4: 0.05092698558022413
-        link5: 0.029564354924849212
-    enabled: true
-    motor_type: damiao
-    name: Aira Zero Follower
-    port: can0
-    role: follower
-    structural_design: damiao_7dof
+        base: -0.027275501640344757
+        link1: -0.7124055848020152
+        link2: -0.8714808880750748
+        link3: 0.7021057450217452
+        link4: -0.0539787899595634
+        link5: 0.002861066605630569
+        gripper: 0.44842450598916805
   aira_zero_leader:
-    enabled: true
-    motor_type: dynamixel_xl330
     name: Aira Zero Leader
-    port: /dev/ttyACM0
     role: leader
+    motor_type: dynamixel_xl330
+    port: /dev/ttyACM0
+    enabled: true
     structural_design: umbra_7dof
   umbra_follower:
-    enabled: true
-    motor_type: sts3215
     name: 'Umbra Follower '
-    port: /dev/ttyUSB0
     role: follower
+    motor_type: sts3215
+    port: /dev/ttyUSB0
+    enabled: true
     structural_design: umbra_7dof
   umbra_leader:
-    enabled: true
-    motor_type: dynamixel_xl330
     name: Umbra Leader
-    port: /dev/ttyACM1
     role: leader
+    motor_type: dynamixel_xl330
+    port: /dev/ttyACM1
+    enabled: true
     structural_design: umbra_7dof
 pairings:
-- follower: aira_zero
-  leader: aira_zero_leader
+- leader: aira_zero_leader
+  follower: aira_zero
   name: Aira Zero Leader -> Aira Zero Follower
-- follower: umbra_follower
-  leader: umbra_leader
+- leader: umbra_leader
+  follower: umbra_follower
   name: 'Umbra Leader -> Umbra Follower '
 robot:
   cameras:

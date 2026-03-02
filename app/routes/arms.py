@@ -184,7 +184,10 @@ def set_home_position(arm_id: str):
     if not bus or not isinstance(bus, DamiaoMotorsBus):
         return JSONResponse(status_code=400, content={"error": "Not a Damiao arm"})
 
-    positions = dict(bus._last_positions)
+    try:
+        positions = bus.sync_read("Present_Position")
+    except Exception as e:
+        return JSONResponse(status_code=400, content={"error": f"Failed to read positions: {e}"})
     if not positions:
         return JSONResponse(status_code=400, content={"error": "No position data available"})
 
