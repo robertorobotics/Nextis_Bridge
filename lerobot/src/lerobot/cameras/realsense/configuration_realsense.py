@@ -58,6 +58,9 @@ class RealSenseCameraConfig(CameraConfig):
     use_depth: bool = False
     rotation: Cv2Rotation = Cv2Rotation.NO_ROTATION
     warmup_s: int = 1
+    exposure: int | None = None     # Manual exposure in microseconds (e.g. 100-10000). None = auto.
+    gain: int | None = None         # Sensor gain (e.g. 16-248). None = auto.
+    brightness: int | None = None   # Sensor brightness (-64 to 64). None = default (0).
 
     def __post_init__(self) -> None:
         if self.color_mode not in (ColorMode.RGB, ColorMode.BGR):

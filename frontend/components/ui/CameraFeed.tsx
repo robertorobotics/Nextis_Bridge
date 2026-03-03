@@ -21,7 +21,7 @@ const MAX_RETRIES = 5;
 
 // Fixed stream parameters — never varies by layout, so the MJPEG URL is stable
 const STREAM_MAX_WIDTH = 960;
-const STREAM_QUALITY = 82;
+const STREAM_QUALITY = 90;
 
 const objectFitClass: Record<string, string> = {
   contain: 'object-contain',

@@ -168,6 +168,41 @@ def reconnect_camera(camera_key: str):
     return result
 
 
+@router.get("/cameras/{camera_key}/exposure")
+def get_camera_exposure(camera_key: str):
+    """Get current exposure/gain settings and supported ranges for a RealSense camera.
+    Returns sensor name, current values, and min/max/step/default for each option.
+    """
+    system = get_state()
+    if not system.camera_service:
+        raise HTTPException(status_code=503, detail="Camera service not initialized")
+    result = system.camera_service.get_camera_exposure_info(camera_key)
+    if result.get("status") == "error":
+        raise HTTPException(status_code=400, detail=result["message"])
+    return result
+
+
+@router.post("/cameras/{camera_key}/exposure")
+async def set_camera_exposure(camera_key: str, request: Request):
+    """Set exposure/gain/brightness for a connected RealSense camera.
+    Body: {"exposure": 200, "gain": 16, "brightness": 0}
+    Omit exposure to re-enable auto-exposure.
+    """
+    system = get_state()
+    if not system.camera_service:
+        raise HTTPException(status_code=503, detail="Camera service not initialized")
+    data = await request.json()
+    result = system.camera_service.set_camera_exposure(
+        camera_key,
+        exposure=data.get("exposure"),
+        gain=data.get("gain"),
+        brightness=data.get("brightness"),
+    )
+    if result.get("status") == "error":
+        raise HTTPException(status_code=400, detail=result["message"])
+    return result
+
+
 @router.post("/cameras/reconnect-all")
 def reconnect_all_cameras():
     """Disconnect all cameras then reconnect sequentially with retry logic.

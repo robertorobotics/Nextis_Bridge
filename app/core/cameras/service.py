@@ -277,6 +277,9 @@ class CameraService:
         width = cam_cfg.get("width", 640)
         height = cam_cfg.get("height", 480)
         use_depth = cam_cfg.get("use_depth", False)
+        exposure = cam_cfg.get("exposure")
+        gain = cam_cfg.get("gain")
+        brightness = cam_cfg.get("brightness")
 
         # Attempt 1: Try with configured resolution
         try:
@@ -286,6 +289,9 @@ class CameraService:
                 width=width,
                 height=height,
                 use_depth=use_depth,
+                exposure=exposure,
+                gain=gain,
+                brightness=brightness,
             )
             camera = RealSenseCamera(c_conf)
             camera.connect(warmup=True)
@@ -315,6 +321,9 @@ class CameraService:
             width=None,
             height=None,
             use_depth=use_depth,
+            exposure=exposure,
+            gain=gain,
+            brightness=brightness,
         )
         camera = RealSenseCamera(c_conf)
         camera.connect(warmup=True)
@@ -350,6 +359,59 @@ class CameraService:
         with camera.frame_lock:
             if camera.latest_frame is None:
                 logger.warning(f"Camera '{camera_key}': latest_frame still None after prime")
+
+    def set_camera_exposure(
+        self,
+        camera_key: str,
+        exposure: int | None = None,
+        gain: int | None = None,
+        brightness: int | None = None,
+    ) -> Dict[str, Any]:
+        """Adjust exposure/gain/brightness on a connected RealSense camera.
+        Persists settings to settings.yaml so they survive reconnect.
+        """
+        with self._lock:
+            camera = self._cameras.get(camera_key)
+
+        if camera is None:
+            return {"status": "error", "message": f"Camera '{camera_key}' not connected"}
+
+        if not isinstance(camera, RealSenseCamera):
+            return {"status": "error", "message": "Exposure control only supported for RealSense cameras"}
+
+        result = camera.set_exposure(exposure=exposure, gain=gain, brightness=brightness)
+
+        if result.get("status") == "ok":
+            # Persist to settings.yaml
+            try:
+                full_config = load_config()
+                cameras_cfg = full_config.get("robot", {}).get("cameras", {})
+                if camera_key in cameras_cfg:
+                    if exposure is not None:
+                        cameras_cfg[camera_key]["exposure"] = exposure
+                    if gain is not None:
+                        cameras_cfg[camera_key]["gain"] = gain
+                    if brightness is not None:
+                        cameras_cfg[camera_key]["brightness"] = brightness
+                    save_config(full_config)
+                    logger.info(f"Persisted exposure settings for '{camera_key}' to settings.yaml")
+            except Exception as e:
+                logger.warning(f"Failed to persist exposure settings for '{camera_key}': {e}")
+
+        return result
+
+    def get_camera_exposure_info(self, camera_key: str) -> Dict[str, Any]:
+        """Get current exposure settings and supported ranges for a connected RealSense camera."""
+        with self._lock:
+            camera = self._cameras.get(camera_key)
+
+        if camera is None:
+            return {"status": "error", "message": f"Camera '{camera_key}' not connected"}
+
+        if not isinstance(camera, RealSenseCamera):
+            return {"status": "error", "message": "Exposure info only available for RealSense cameras"}
+
+        return camera.get_exposure_info()
 
     def _update_camera_path(self, camera_key: str, new_path: str):
         """Update the device path for an OpenCV camera in settings.yaml."""

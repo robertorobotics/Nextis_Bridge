@@ -182,6 +182,7 @@ class RealSenseCamera(Camera):
             ) from e
 
         self._configure_capture_settings()
+        self._apply_sensor_options()
 
         if warmup:
             time.sleep(
@@ -312,6 +313,148 @@ class RealSenseCamera(Camera):
             else:
                 self.width, self.height = actual_width, actual_height
                 self.capture_width, self.capture_height = actual_width, actual_height
+
+    def _get_color_sensor(self):
+        """Find the RGB/color sensor on the connected device."""
+        if self.rs_profile is None:
+            return None
+        device = self.rs_profile.get_device()
+        for sensor in device.query_sensors():
+            try:
+                name = sensor.get_info(rs.camera_info.name)
+                if "RGB" in name or "Color" in name:
+                    return sensor
+            except Exception:
+                pass
+        # Fallback: first sensor that supports exposure
+        for sensor in device.query_sensors():
+            if sensor.supports(rs.option.exposure):
+                return sensor
+        return None
+
+    def _apply_sensor_options(self) -> None:
+        """Apply exposure/gain/brightness settings from config to the color sensor."""
+        has_settings = (
+            self.config.exposure is not None
+            or self.config.gain is not None
+            or self.config.brightness is not None
+        )
+        if not has_settings:
+            return
+
+        color_sensor = self._get_color_sensor()
+        if color_sensor is None:
+            logger.warning(f"{self}: no color sensor found, skipping exposure settings")
+            return
+
+        if self.config.exposure is not None:
+            if color_sensor.supports(rs.option.enable_auto_exposure):
+                color_sensor.set_option(rs.option.enable_auto_exposure, 0)
+            if color_sensor.supports(rs.option.exposure):
+                color_sensor.set_option(rs.option.exposure, float(self.config.exposure))
+                logger.info(f"{self}: exposure set to {self.config.exposure} us")
+
+        if self.config.gain is not None and color_sensor.supports(rs.option.gain):
+            color_sensor.set_option(rs.option.gain, float(self.config.gain))
+            logger.info(f"{self}: gain set to {self.config.gain}")
+
+        if self.config.brightness is not None and color_sensor.supports(rs.option.brightness):
+            color_sensor.set_option(rs.option.brightness, float(self.config.brightness))
+            logger.info(f"{self}: brightness set to {self.config.brightness}")
+
+    def set_exposure(
+        self,
+        exposure: int | None = None,
+        gain: int | None = None,
+        brightness: int | None = None,
+    ) -> dict:
+        """Adjust sensor exposure/gain/brightness on a connected camera at runtime.
+
+        Args:
+            exposure: Exposure in microseconds. None = re-enable auto-exposure.
+            gain: Sensor gain value. None = unchanged.
+            brightness: Sensor brightness (-64 to 64). None = unchanged.
+
+        Returns:
+            Dict with applied settings and their actual values.
+        """
+        if not self.is_connected:
+            return {"status": "error", "message": f"{self} is not connected"}
+
+        color_sensor = self._get_color_sensor()
+        if color_sensor is None:
+            return {"status": "error", "message": "No color sensor found"}
+
+        result = {"status": "ok"}
+
+        if exposure is not None:
+            if color_sensor.supports(rs.option.enable_auto_exposure):
+                color_sensor.set_option(rs.option.enable_auto_exposure, 0)
+            if color_sensor.supports(rs.option.exposure):
+                color_sensor.set_option(rs.option.exposure, float(exposure))
+                result["exposure"] = exposure
+        elif exposure is None and gain is None and brightness is None:
+            # All None = re-enable auto-exposure
+            if color_sensor.supports(rs.option.enable_auto_exposure):
+                color_sensor.set_option(rs.option.enable_auto_exposure, 1)
+                result["auto_exposure"] = True
+
+        if gain is not None and color_sensor.supports(rs.option.gain):
+            color_sensor.set_option(rs.option.gain, float(gain))
+            result["gain"] = gain
+
+        if brightness is not None and color_sensor.supports(rs.option.brightness):
+            color_sensor.set_option(rs.option.brightness, float(brightness))
+            result["brightness"] = brightness
+
+        return result
+
+    def get_exposure_info(self) -> dict:
+        """Return current sensor settings and supported ranges for exposure-related options."""
+        if not self.is_connected:
+            return {"status": "error", "message": f"{self} is not connected"}
+
+        color_sensor = self._get_color_sensor()
+        if color_sensor is None:
+            return {"status": "error", "message": "No color sensor found"}
+
+        sensor_name = "unknown"
+        try:
+            sensor_name = color_sensor.get_info(rs.camera_info.name)
+        except Exception:
+            pass
+
+        options_to_query = [
+            ("exposure", rs.option.exposure),
+            ("gain", rs.option.gain),
+            ("brightness", rs.option.brightness),
+            ("enable_auto_exposure", rs.option.enable_auto_exposure),
+            ("white_balance", rs.option.white_balance),
+            ("auto_exposure_priority", rs.option.auto_exposure_priority),
+        ]
+
+        settings = {}
+        for name, option in options_to_query:
+            if color_sensor.supports(option):
+                try:
+                    opt_range = color_sensor.get_option_range(option)
+                    settings[name] = {
+                        "current": color_sensor.get_option(option),
+                        "min": opt_range.min,
+                        "max": opt_range.max,
+                        "step": opt_range.step,
+                        "default": opt_range.default,
+                    }
+                except Exception as e:
+                    settings[name] = {"error": str(e)}
+            else:
+                settings[name] = {"supported": False}
+
+        return {
+            "status": "ok",
+            "sensor_name": sensor_name,
+            "settings": settings,
+        }
 
     def read_depth(self, timeout_ms: int = 200) -> NDArray[Any]:
         """
