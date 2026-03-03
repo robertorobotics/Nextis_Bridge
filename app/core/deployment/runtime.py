@@ -72,9 +72,15 @@ class DeploymentRuntime:
         self._leader = None
         self._follower = None
         self._arm_defs: List = []
+        self._active_arm_ids: List[str] = []
 
         # Dry-run diagnostics log (populated during dry_run=True)
         self._dry_run_log: list = []
+
+        # Post-pre-position snapshot for drift detection
+        self._post_preposition_positions: Dict[str, float] = {}
+        # Velocity limit to restore in _control_loop (deferred from pre-position)
+        self._pre_position_old_vel: Optional[float] = None
 
         # Counters
         self._frame_count = 0
@@ -108,6 +114,7 @@ class DeploymentRuntime:
 
         try:
             self._config = config
+            self._active_arm_ids = list(active_arm_ids) if active_arm_ids else []
             self._stop_event.clear()
             self._frame_count = 0
             self._episode_count = 0
@@ -115,29 +122,29 @@ class DeploymentRuntime:
             self._autonomous_frames = 0
             self._human_frames = 0
 
-            # 1. Resolve arms
+            # 1. Resolve arms (sets _follower, _leader, _arm_defs)
             self._resolve_arms(active_arm_ids)
 
-            # 2. Re-enable motors (may be disabled from teleop homing)
-            self._enable_follower_motors()
+            # ---------------------------------------------------------------
+            # Phase A: Non-motor setup (policy, safety, observation builder)
+            # All done BEFORE motor operations to eliminate the loading gap
+            # that previously let motors drift unmonitored for 200-500ms.
+            # ---------------------------------------------------------------
 
-            # 3. Pre-position follower to leader's current position
-            self._pre_position_to_leader()
-
-            # 4. Load policy
+            # 2. Load policy
             self._load_policy(config.policy_id)
 
-            # 4b. Apply temporal ensembling override (must happen BEFORE reset,
+            # 2b. Apply temporal ensembling override (must happen BEFORE reset,
             #     because reset() initializes the ensembler's internal state)
             self._apply_temporal_ensemble_override()
 
-            # 4c. Reset policy internal state (clears stale action queue /
+            # 2c. Reset policy internal state (clears stale action queue /
             #     temporal ensembler from prior deployments)
             if hasattr(self._policy, "reset"):
                 self._policy.reset()
                 logger.info("Policy internal state reset")
 
-            # 5. Auto-select safety preset if no custom safety tuning provided
+            # 3. Auto-select safety preset if no custom safety tuning provided
             if not config.safety.motor_models:
                 policy_type = getattr(self._policy_config, "policy_type", "")
                 preset_config = SafetyConfig.from_policy_type(policy_type)
@@ -150,16 +157,16 @@ class DeploymentRuntime:
                     policy_type,
                 )
 
-            # 5b. Populate safety config from arm definitions
+            # 3b. Populate safety config from arm definitions
             self._populate_safety_config(config.safety)
 
-            # 6. Create safety pipeline
+            # 4. Create safety pipeline
             safety_layer = getattr(self._teleop, "safety", None)
             self._safety_pipeline = SafetyPipeline(
                 config.safety, safety_layer=safety_layer
             )
 
-            # 7. Create observation builder
+            # 5. Create observation builder
             self._obs_builder = ObservationBuilder(
                 checkpoint_path=self._checkpoint_path,
                 policy=self._policy,
@@ -167,7 +174,7 @@ class DeploymentRuntime:
                 task=config.task or "",
             )
 
-            # 8. Auto-enable extended observation if policy expects vel/tau
+            # 6. Auto-enable extended observation if policy expects vel/tau
             state_names = self._obs_builder.get_training_state_names()
             if state_names:
                 needs_extended = any(
@@ -180,15 +187,15 @@ class DeploymentRuntime:
                         and hasattr(self._follower.config, "record_extended_state")
                     ):
                         self._follower.config.record_extended_state = True
-                        logger.info(
-                            "Auto-enabled extended observation on follower "
+                        logger.warning(
+                            "DEPLOY: Auto-enabled extended observation on follower "
                             "(policy trained with %d states including vel/tau)",
                             len(state_names),
                         )
                     else:
                         logger.warning(
-                            "Policy expects extended state (vel/tau) but follower %s "
-                            "does not support record_extended_state. "
+                            "DEPLOY CRITICAL: Policy expects extended state (vel/tau) "
+                            "but follower %s does not support record_extended_state. "
                             "%d states will be zero at deployment!",
                             type(self._follower).__name__,
                             sum(
@@ -197,8 +204,46 @@ class DeploymentRuntime:
                                 if n.endswith(".vel") or n.endswith(".tau")
                             ),
                         )
+                elif needs_extended and self._follower is None:
+                    logger.warning(
+                        "DEPLOY CRITICAL: Policy expects extended state (vel/tau) "
+                        "but no follower is available!"
+                    )
+            else:
+                logger.warning(
+                    "DEPLOY: Could not load training state names from dataset — "
+                    "cannot verify extended observation requirements"
+                )
 
-            # 9. Create intervention detector (for HIL/SERL modes)
+            # 6b. Check camera availability if policy expects cameras
+            if hasattr(self._policy, "config") and hasattr(self._policy.config, "image_features"):
+                expected_cams = [
+                    k.split(".")[-1]
+                    for k in self._policy.config.image_features
+                ]
+                if expected_cams:
+                    available_cams = (
+                        list(self._camera_service.cameras.keys())
+                        if self._camera_service
+                        else []
+                    )
+                    missing = [c for c in expected_cams if c not in available_cams]
+                    if missing:
+                        logger.warning(
+                            "DEPLOY CRITICAL: Policy expects cameras %s but only %s "
+                            "are available. Missing cameras will produce zero input — "
+                            "policy output will be UNRELIABLE!",
+                            expected_cams,
+                            available_cams or "none",
+                        )
+                    else:
+                        logger.warning(
+                            "DEPLOY: All %d expected cameras available: %s",
+                            len(expected_cams),
+                            expected_cams,
+                        )
+
+            # 7. Create intervention detector (for HIL/SERL modes)
             policy_arms = (
                 getattr(self._policy_config, "arms", None) or ["left", "right"]
             )
@@ -206,6 +251,19 @@ class DeploymentRuntime:
                 policy_arms=policy_arms,
                 loop_hz=config.loop_hz,
             )
+
+            # ---------------------------------------------------------------
+            # Phase B: Motor operations (enable, pre-position, control loop)
+            # Kept together to minimize unmonitored time.
+            # ---------------------------------------------------------------
+
+            # 8. Re-enable motors (may be disabled from teleop homing)
+            self._enable_follower_motors()
+            self._log_follower_positions("after enable")
+
+            # 9. Pre-position follower to leader's current position
+            self._pre_position_to_leader()
+            self._log_follower_positions("after pre-position")
 
             # 10. Start recording for HIL/SERL modes
             if config.mode in (DeploymentMode.HIL, DeploymentMode.HIL_SERL):
@@ -369,6 +427,49 @@ class DeploymentRuntime:
         if self._policy and hasattr(self._policy, "reset"):
             self._policy.reset()
 
+        # Log positions at policy start and check for drift
+        self._log_follower_positions("policy start")
+        if self._post_preposition_positions:
+            try:
+                obs = self._follower.get_observation() if self._follower else {}
+                for key, prev in self._post_preposition_positions.items():
+                    current = obs.get(key)
+                    if current is not None and abs(current - prev) > 0.05:
+                        logger.warning(
+                            "DEPLOY DRIFT: %s moved %.4f rad during loading gap "
+                            "(%.4f → %.4f)",
+                            key,
+                            current - prev,
+                            prev,
+                            current,
+                        )
+            except Exception:
+                pass
+
+        # Restore velocity_limit that was deferred from pre-position.
+        # Kept at PRE_POSITION_VEL during the gap to prevent rate-limiter
+        # bypass; now safe to restore because the control loop will send
+        # motor commands every frame.
+        if self._pre_position_old_vel is not None:
+            try:
+                from lerobot.motors.damiao.damiao import DamiaoMotorsBus
+
+                bus = getattr(self._follower, "bus", None)
+                if bus and isinstance(bus, DamiaoMotorsBus):
+                    bus.velocity_limit = self._pre_position_old_vel
+                    logger.info(
+                        "Control loop: velocity_limit restored to %.2f",
+                        self._pre_position_old_vel,
+                    )
+            except Exception:
+                pass
+            self._pre_position_old_vel = None
+
+        # Capture the target speed_scale before warmup ramp modifies it
+        target_speed_scale = (
+            self._config.safety.speed_scale if self._config else 1.0
+        )
+
         while not self._stop_event.is_set():
             t0 = time.monotonic()
 
@@ -417,6 +518,18 @@ class DeploymentRuntime:
                     if isinstance(v, (int, float))
                     and not k.endswith((".vel", ".tau"))
                 }
+
+                # 4a. Velocity ramp during warmup: start at 30% speed,
+                #     linearly increase to full speed over warmup period
+                warmup = self._config.warmup_frames if self._config else 0
+                if warmup > 0 and self._frame_count < warmup:
+                    ramp = 0.3 + 0.7 * (self._frame_count / warmup)
+                    self._safety_pipeline.update_speed_scale(
+                        target_speed_scale * ramp
+                    )
+                elif self._frame_count == warmup and warmup > 0:
+                    self._safety_pipeline.update_speed_scale(target_speed_scale)
+
                 filtered_action = self._safety_pipeline.process(
                     action, observation_positions, robot=self._follower, dt=dt
                 )
@@ -431,7 +544,6 @@ class DeploymentRuntime:
 
                 # 4c. Warm-up blending: ramp from current position to
                 #     policy target over the first N frames to avoid jerks
-                warmup = self._config.warmup_frames if self._config else 0
                 if warmup > 0 and self._frame_count < warmup:
                     blend_alpha = (self._frame_count + 1) / warmup
                     for key in filtered_action:
@@ -976,6 +1088,23 @@ class DeploymentRuntime:
             if leader_key in leader_obs:
                 target[dam_name] = float(leader_obs[leader_key])
 
+        # Fallback: direct name matching (handles Damiao-to-Damiao where
+        # leader uses same naming convention as follower, e.g. "base.pos")
+        if not target:
+            follower_motors = set(
+                getattr(self._follower, "_motor_names", [])
+            )
+            for key, value in leader_obs.items():
+                if isinstance(value, (int, float)) and key.endswith(".pos"):
+                    motor_name = key.removesuffix(".pos")
+                    if motor_name in follower_motors:
+                        target[motor_name] = float(value)
+            if target:
+                logger.info(
+                    "Pre-position: used direct name matching (%d motors)",
+                    len(target),
+                )
+
         if not target:
             logger.warning("Pre-position: no leader positions mapped")
             return
@@ -1008,12 +1137,43 @@ class DeploymentRuntime:
                 {k: f"{v:+.3f}" for k, v in target_action.items()},
             )
 
-            # Ramp phase
+            # Ramp phase — with periodic torque monitoring for collision
             t0 = time.monotonic()
+            ramp_frame = 0
+            collision_detected = False
             while time.monotonic() - t0 < PRE_POSITION_DURATION:
                 if self._stop_event.is_set():
                     break
                 self._follower.send_action(target_action)
+                ramp_frame += 1
+
+                # Torque check every 10 frames (~3Hz) to detect collisions
+                if (
+                    ramp_frame % 10 == 0
+                    and hasattr(self._follower, "get_torques")
+                    and hasattr(self._follower, "get_torque_limits")
+                ):
+                    try:
+                        torques = self._follower.get_torques()
+                        limits = self._follower.get_torque_limits()
+                        for name, tau in torques.items():
+                            limit = limits.get(name, 10.0)
+                            if abs(tau) > limit * 0.9:
+                                logger.warning(
+                                    "DEPLOY: Pre-position aborted — %s "
+                                    "torque %.1f Nm near limit %.1f Nm "
+                                    "(possible collision)",
+                                    name,
+                                    tau,
+                                    limit,
+                                )
+                                collision_detected = True
+                                break
+                    except Exception:
+                        pass
+                if collision_detected:
+                    break
+
                 time.sleep(1.0 / 30)
 
             # Settle phase — hold position to let velocity decay
@@ -1025,8 +1185,18 @@ class DeploymentRuntime:
                 self._follower.send_action(target_action)
                 time.sleep(1.0 / 30)
 
+            # NOTE: Do NOT "freeze" motors by sending actual positions as
+            # goals.  The MIT position error (p_des − p_actual ≈ gravity/kp)
+            # IS the gravity compensation.  Zeroing it removes the torque
+            # that holds the arm up, causing it to drop under gravity.
+            # Instead, keep the pre-position target as p_des — the MIT
+            # controller will hold the arm stable against gravity.
+
+            # Delay velocity_limit restoration until _control_loop() so the
+            # rate limiter stays active during the brief gap before the
+            # first policy command.
             if has_damiao_bus and old_vel is not None:
-                bus.velocity_limit = old_vel
+                self._pre_position_old_vel = old_vel
 
             logger.info("Pre-positioning complete")
 
@@ -1135,7 +1305,11 @@ class DeploymentRuntime:
         )
 
     def _populate_safety_config(self, safety: SafetyConfig) -> None:
-        """Fill joint_limits and motor_models from arm definitions."""
+        """Fill joint_limits and motor_models from arm definitions.
+
+        Tries YAML config first, then falls back to reading directly from
+        the DamiaoFollowerRobot bus which has per-motor type and joint limits.
+        """
         for arm_def in self._arm_defs:
             motor_model = arm_def.motor_type.value.upper()
 
@@ -1156,13 +1330,42 @@ class DeploymentRuntime:
                 # Per-motor model if available (e.g. Damiao arms have
                 # different motor types per joint)
                 per_motor_model = motor_models_cfg.get(name, model_key)
-                safety.motor_models[name] = per_motor_model
+                safety.motor_models[f"{name}.pos"] = per_motor_model
 
             # Joint limits from calibration ranges in config
             joint_limits = arm_def.config.get("joint_limits", {})
             for name, limits in joint_limits.items():
                 if isinstance(limits, (list, tuple)) and len(limits) == 2:
-                    safety.joint_limits[name] = tuple(limits)
+                    safety.joint_limits[f"{name}.pos"] = tuple(limits)
+
+        # Fallback: read per-motor type and joint limits directly from the
+        # DamiaoFollowerRobot bus.  The bus knows each motor's exact type
+        # (J8009P, J4340P, J4310) and has calibrated joint limits.
+        if not safety.motor_models and self._follower is not None:
+            try:
+                from lerobot.robots.damiao_follower.damiao_follower import (
+                    DamiaoFollowerRobot,
+                )
+
+                if isinstance(self._follower, DamiaoFollowerRobot):
+                    bus = self._follower.bus
+                    for name, mcfg in bus._motor_configs.items():
+                        key = f"{name}.pos"
+                        safety.motor_models[key] = mcfg.motor_type
+                    for name, (lo, hi) in bus._active_joint_limits.items():
+                        key = f"{name}.pos"
+                        safety.joint_limits[key] = (lo, hi)
+                    logger.warning(
+                        "DEPLOY: Populated safety config from Damiao bus: "
+                        "%d motor models, %d joint limits — %s",
+                        len(safety.motor_models),
+                        len(safety.joint_limits),
+                        {k: v for k, v in safety.motor_models.items()},
+                    )
+            except Exception as e:
+                logger.warning(
+                    "Failed to read safety config from robot bus: %s", e
+                )
 
     def _start_recording(self, config: DeploymentConfig) -> None:
         """Start recording session for HIL/SERL modes."""
@@ -1181,3 +1384,26 @@ class DeploymentRuntime:
                 logger.info("Recording session started: %s", repo_id)
         except Exception as e:
             logger.warning("Failed to start recording session: %s", e)
+
+    def _log_follower_positions(self, label: str) -> None:
+        """Log follower joint positions at WARNING level for diagnostics.
+
+        When label is "after pre-position", also stores a snapshot for
+        drift detection at control loop start.
+        """
+        if self._follower is None:
+            return
+        try:
+            obs = self._follower.get_observation()
+            raw_positions = {
+                k: v
+                for k, v in obs.items()
+                if isinstance(v, (int, float)) and k.endswith(".pos")
+            }
+            display = {k: f"{v:+.4f}" for k, v in raw_positions.items()}
+            logger.warning("DEPLOY [%s] follower positions: %s", label, display)
+
+            if label == "after pre-position":
+                self._post_preposition_positions = dict(raw_positions)
+        except Exception:
+            pass

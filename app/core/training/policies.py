@@ -240,8 +240,9 @@ class PolicyMixin:
         action_shape = output_features.get("action", {}).get("shape", [14])
         action_dim = action_shape[0] if action_shape else 14
 
-        # Infer which arms were used
-        arms = self._infer_arms_from_policy(policy, state_dim)
+        # Infer which arms were used (action_dim reflects actual motor count,
+        # unlike state_dim which may include vel/tau for extended-state policies)
+        arms = self._infer_arms_from_policy(policy, state_dim, action_dim)
 
         policy_type = config.get("type", "unknown")
 
@@ -255,7 +256,7 @@ class PolicyMixin:
             policy_type=policy_type
         )
 
-    def _infer_arms_from_policy(self, policy: PolicyInfo, state_dim: int) -> List[str]:
+    def _infer_arms_from_policy(self, policy: PolicyInfo, state_dim: int, action_dim: int = 0) -> List[str]:
         """Infer which arms were used by checking dataset info.json or dimension heuristics."""
         # First try to get from dataset metadata
         if policy.dataset_repo_id:
@@ -277,8 +278,10 @@ class PolicyMixin:
                     logger.warning(f"[TrainingService] Failed to read dataset info.json: {e}")
 
         # Fallback: dimension-based heuristic
-        # 7 DOF = single arm (default to left), 14 DOF = both arms
-        if state_dim <= 7:
+        # Use action_dim (actual motor count) over state_dim, since state_dim
+        # may be inflated by extended state (pos + vel + tau = 3x motor count)
+        check_dim = action_dim if action_dim > 0 else state_dim
+        if check_dim <= 7:
             return ["left"]
         else:
             return ["left", "right"]

@@ -200,15 +200,15 @@ def test_speed_scale_halves_velocity(basic_config):
 
 
 def test_update_speed_scale_clamps(pipeline):
-    """update_speed_scale clamps to [0.1, 1.0]."""
+    """update_speed_scale clamps to [0.1, 1.0] in runtime override."""
     pipeline.update_speed_scale(0.0)
-    assert pipeline._config.speed_scale == 0.1
+    assert pipeline._runtime_speed_scale == 0.1
 
     pipeline.update_speed_scale(5.0)
-    assert pipeline._config.speed_scale == 1.0
+    assert pipeline._runtime_speed_scale == 1.0
 
     pipeline.update_speed_scale(0.5)
-    assert pipeline._config.speed_scale == 0.5
+    assert pipeline._runtime_speed_scale == 0.5
 
 
 # ---------------------------------------------------------------------------

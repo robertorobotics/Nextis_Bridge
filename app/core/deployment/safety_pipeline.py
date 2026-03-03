@@ -57,6 +57,9 @@ class SafetyPipeline:
         self._hold_positions: Dict[str, float] = {}
         self._frame_count: int = 0
         self._estop: bool = False
+        # Separate runtime speed_scale (for warmup ramp etc.) that doesn't
+        # mutate the original SafetyConfig.
+        self._runtime_speed_scale: Optional[float] = None
         self._readings = SafetyReadings(speed_scale=config.speed_scale)
 
     # ------------------------------------------------------------------
@@ -146,9 +149,13 @@ class SafetyPipeline:
         logger.info("Safety pipeline ESTOP cleared")
 
     def update_speed_scale(self, scale: float) -> None:
-        """Update speed scale, clamped to [0.1, 1.0]."""
-        self._config.speed_scale = max(0.1, min(1.0, scale))
-        self._readings.speed_scale = self._config.speed_scale
+        """Update runtime speed scale override, clamped to [0.1, 1.0].
+
+        This sets a runtime override that does NOT mutate the original
+        SafetyConfig.  Pass ``None`` to revert to the config default.
+        """
+        self._runtime_speed_scale = max(0.1, min(1.0, scale))
+        self._readings.speed_scale = self._runtime_speed_scale
 
     def get_readings(self) -> SafetyReadings:
         """Return a snapshot of current safety readings."""
@@ -162,6 +169,7 @@ class SafetyPipeline:
         self._hold_positions.clear()
         self._frame_count = 0
         self._estop = False
+        self._runtime_speed_scale = None
         self._readings = SafetyReadings(speed_scale=self._config.speed_scale)
 
     # ------------------------------------------------------------------
@@ -210,7 +218,7 @@ class SafetyPipeline:
         for motor, target in action.items():
             current = observation.get(motor, target)
             delta = target - current
-            max_delta = self._config.effective_max_velocity(motor) * dt
+            max_delta = self._effective_max_velocity(motor) * dt
 
             if abs(delta) > max_delta:
                 clamped_delta = max_delta if delta > 0 else -max_delta
@@ -308,6 +316,15 @@ class SafetyPipeline:
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+
+    def _effective_max_velocity(self, motor_name: str) -> float:
+        """Max velocity for a motor, using runtime override if set."""
+        from .types import DEFAULT_VELOCITY_LIMITS, FALLBACK_VELOCITY_LIMIT
+
+        model = self._config.motor_models.get(motor_name, "")
+        base_limit = DEFAULT_VELOCITY_LIMITS.get(model, FALLBACK_VELOCITY_LIMIT)
+        scale = self._runtime_speed_scale if self._runtime_speed_scale is not None else self._config.speed_scale
+        return base_limit * max(0.1, min(1.0, scale))
 
     def _get_hold_output(
         self,

@@ -130,7 +130,20 @@ class ObservationBuilder:
         # Backward compat: older datasets without separate action names
         fallback = self.get_training_state_names()
         if fallback:
-            logger.info("Action names not found in dataset, falling back to state names")
+            has_extended = any(n.endswith((".vel", ".tau")) for n in fallback)
+            if has_extended:
+                all_count = len(fallback)
+                fallback = [n for n in fallback if n.endswith(".pos")]
+                logger.info(
+                    "Action names not found; filtered %d extended state names "
+                    "to %d position-only",
+                    all_count,
+                    len(fallback),
+                )
+            else:
+                logger.info(
+                    "Action names not found in dataset, falling back to state names"
+                )
         self._training_action_names = fallback
         return fallback
 
@@ -275,13 +288,25 @@ class ObservationBuilder:
         else:
             policy_obs = self._prepare_manual(raw_obs, device)
 
-        # Diagnostic logging for first 3 frames
-        if self._inference_frame_count < 3 and "observation.state" in policy_obs:
-            s = policy_obs["observation.state"]
-            logger.info(
-                "[frame %d] state tensor stats: min=%.4f max=%.4f mean=%.4f",
-                self._inference_frame_count, s.min().item(), s.max().item(), s.mean().item(),
+        # Diagnostic logging for first 3 frames (WARNING level to ensure visibility)
+        if self._inference_frame_count < 3:
+            if "observation.state" in policy_obs:
+                s = policy_obs["observation.state"]
+                logger.warning(
+                    "DEPLOY [frame %d] state tensor stats: min=%.4f max=%.4f mean=%.4f dim=%d",
+                    self._inference_frame_count,
+                    s.min().item(), s.max().item(), s.mean().item(),
+                    s.shape[-1],
+                )
+            has_images = sum(
+                1 for k in policy_obs if k.startswith("observation.images.")
             )
+            if self._inference_frame_count == 0:
+                logger.warning(
+                    "DEPLOY [frame 0] observation keys: %s (%d image features)",
+                    [k for k in sorted(policy_obs.keys())],
+                    has_images,
+                )
         self._inference_frame_count += 1
 
         # Pi0.5 language tokenization
@@ -457,14 +482,15 @@ class ObservationBuilder:
             )
             return {}
 
-        # Diagnostic logging for first 3 frames
+        # Diagnostic logging for first 3 frames (WARNING level for visibility)
         if self._inference_frame_count <= 3:
-            logger.info(
-                "[frame %d] action stats: min=%.4f max=%.4f mean=%.4f",
+            logger.warning(
+                "DEPLOY [frame %d] denormalized action: min=%.4f max=%.4f mean=%.4f values=%s",
                 self._inference_frame_count - 1,
                 action_np.min(),
                 action_np.max(),
                 action_np.mean(),
+                {name: f"{float(action_np[i]):.4f}" for i, name in enumerate(action_names)},
             )
 
         return {name: float(action_np[i]) for i, name in enumerate(action_names)}
@@ -479,7 +505,13 @@ class ObservationBuilder:
             action_tensor = torch.tensor(action, dtype=torch.float32)
 
         try:
-            result = self._postprocessor({"action": action_tensor})
+            # Postprocessor expects a bare tensor (PolicyAction = torch.Tensor),
+            # not a dict. Its to_transition converter wraps it into EnvTransition,
+            # the unnormalizer denormalizes, and to_output extracts the tensor back.
+            result = self._postprocessor(action_tensor)
+            if isinstance(result, torch.Tensor):
+                return result.cpu().numpy()
+            # Fallback: if result is a dict (older LeRobot versions)
             return result["action"].cpu().numpy()
         except Exception as e:
             logger.warning("Postprocessor failed (%s), falling back to manual", e)

@@ -165,17 +165,16 @@ def get_deployment_status():
     }
 
     # Include active arms and their connection states
-    config = system.deployment_runtime._config
-    if config:
-        result["active_arms"] = []
-        if system.arm_registry:
-            for arm_id in getattr(config, "_active_arm_ids", []):
-                arm = system.arm_registry.get_arm(arm_id)
-                if arm:
-                    result["active_arms"].append({
-                        "id": arm_id,
-                        "connected": system.arm_registry.arm_status.get(arm_id, "disconnected") == "connected",
-                    })
+    result["active_arms"] = []
+    arm_ids = getattr(system.deployment_runtime, "_active_arm_ids", [])
+    if arm_ids and system.arm_registry:
+        for arm_id in arm_ids:
+            arm = system.arm_registry.get_arm(arm_id)
+            if arm:
+                result["active_arms"].append({
+                    "id": arm_id,
+                    "connected": system.arm_registry.arm_status.get(arm_id, "disconnected") == "connected",
+                })
 
     return result
 

@@ -151,7 +151,7 @@ class DeploymentConfig:
     # Control loop frequency (must match training recording fps)
     loop_hz: int = 30
     # Warm-up frames: blend policy output with current position to avoid jerks
-    warmup_frames: int = 5
+    warmup_frames: int = 15
     # ACT temporal ensembling override: float (e.g. 0.01) enables TE at
     # deployment time even if trained without it. None = use training config.
     temporal_ensemble_override: Optional[float] = None
