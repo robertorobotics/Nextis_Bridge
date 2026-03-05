@@ -1,11 +1,15 @@
 import { useRef, useEffect, useState } from "react";
-import { PanelRight } from "lucide-react";
+import { PanelRight, Loader2 } from "lucide-react";
 
 interface RecordingBottomBarProps {
   episodeActive: boolean;
   episodeCount: number;
   episodeStartTime: number | null;
   onToggleSidePanel: () => void;
+  onStartEpisode: () => void;
+  onSaveEpisode: () => void;
+  onDiscardEpisode: () => void;
+  isBusy: boolean;
   recordingFps?: number;
 }
 
@@ -23,6 +27,10 @@ export default function RecordingBottomBar({
   episodeCount,
   episodeStartTime,
   onToggleSidePanel,
+  onStartEpisode,
+  onSaveEpisode,
+  onDiscardEpisode,
+  isBusy,
   recordingFps = 30,
 }: RecordingBottomBarProps) {
   const [timerState, setTimerState] = useState({ elapsed: "00:00.0", frameCount: 0 });
@@ -99,11 +107,44 @@ export default function RecordingBottomBar({
       {/* Spacer */}
       <div className="flex-1" />
 
-      {/* Shortcut hints */}
-      <span className="text-zinc-600 text-[10px]">
+      {/* Episode control buttons */}
+      <div className="flex items-center gap-2">
+        {episodeActive ? (
+          <>
+            <button
+              onClick={onSaveEpisode}
+              disabled={isBusy}
+              className="h-8 px-4 rounded-lg text-xs font-semibold transition-colors bg-emerald-600 hover:bg-emerald-700 active:bg-emerald-800 text-white disabled:opacity-40 disabled:cursor-not-allowed flex items-center gap-1.5 touch-manipulation"
+            >
+              {isBusy ? <Loader2 className="w-3 h-3 animate-spin" /> : "Save"}
+            </button>
+            <button
+              onClick={onDiscardEpisode}
+              disabled={isBusy}
+              className="h-8 px-3 rounded-lg text-xs font-semibold transition-colors bg-red-600/20 hover:bg-red-600/30 active:bg-red-600/40 text-red-400 border border-red-600/30 disabled:opacity-40 disabled:cursor-not-allowed touch-manipulation"
+            >
+              Discard
+            </button>
+          </>
+        ) : (
+          <button
+            onClick={onStartEpisode}
+            disabled={isBusy}
+            className="h-8 px-4 rounded-lg text-xs font-semibold transition-colors bg-emerald-600 hover:bg-emerald-700 active:bg-emerald-800 text-white disabled:opacity-40 disabled:cursor-not-allowed flex items-center gap-1.5 touch-manipulation"
+          >
+            {isBusy ? <Loader2 className="w-3 h-3 animate-spin" /> : "Start"}
+          </button>
+        )}
+      </div>
+
+      {/* Divider */}
+      <div className="w-px h-5 bg-zinc-700" />
+
+      {/* Shortcut hints (hidden on small screens) */}
+      <span className="text-zinc-600 text-[10px] hidden sm:inline">
         SPACE start/save &middot; D discard
       </span>
-      <span className="text-zinc-600 text-[10px] flex items-center gap-1">
+      <span className="text-zinc-600 text-[10px] items-center gap-1 hidden sm:flex">
         <kbd className="px-1.5 py-0.5 rounded bg-zinc-800 border border-zinc-700 text-zinc-400 text-[10px] font-mono">
           ESC
         </kbd>

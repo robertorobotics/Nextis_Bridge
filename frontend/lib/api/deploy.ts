@@ -24,6 +24,11 @@ export const deployApi = {
 
   estop: () => api.post<{ status: string }>("/deploy/estop"),
 
+  reset: () => api.post<{ status: string }>("/deploy/reset"),
+
+  restart: () =>
+    api.post<{ status: string; state: string; mode: string }>("/deploy/restart"),
+
   retrain: (opts?: Record<string, unknown>) =>
     api.post<void>("/deploy/retrain", opts),
 

@@ -87,3 +87,8 @@
 ::-webkit-scrollbar-thumb:hover {
   background: var(--scrollbar-thumb-hover);
 }
+
+/* Suppress tap highlight on touch devices */
+@media (hover: none) {
+  * { -webkit-tap-highlight-color: transparent; }
+}

@@ -171,7 +171,7 @@ export default function Dashboard() {
       </div>
 
       {/* 2. LAYER: UI OVERLAY (Header & Dock) */}
-      <div className="absolute top-0 left-0 right-0 z-30 p-6 pointer-events-none flex justify-between items-start">
+      <div className="absolute top-0 left-0 right-0 z-30 p-4 lg:p-6 pointer-events-none flex flex-col items-start gap-3 xl:flex-row xl:justify-between xl:items-start">
         {/* Branding + User */}
         <div className="pointer-events-auto flex items-center gap-2">
           <div className="flex items-center gap-3 bg-white/80 dark:bg-zinc-900/80 backdrop-blur-xl border border-white/50 dark:border-zinc-700/50 px-4 py-2 rounded-2xl shadow-sm hover:bg-white dark:hover:bg-zinc-900 transition-colors cursor-default">

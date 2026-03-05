@@ -224,6 +224,10 @@ export default function RecordingActiveView({
         episodeCount={status.episode_count}
         episodeStartTime={episodeStartTime}
         onToggleSidePanel={() => setSidePanelOpen((prev) => !prev)}
+        onStartEpisode={handleStartEpisode}
+        onSaveEpisode={handleSaveEpisode}
+        onDiscardEpisode={handleDiscardEpisode}
+        isBusy={isBusy}
         recordingFps={30}
       />
       <RecordingSidePanel

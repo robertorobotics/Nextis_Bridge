@@ -137,6 +137,33 @@ export default function DeployRuntime({ status, activeCameras, speak, onStopped 
     }
   };
 
+  const resetFromEstop = async () => {
+    setIsProcessing(true);
+    try {
+      await deployApi.reset();
+      speak("Reset complete. Ready for new deployment.");
+      onStopped();
+    } catch (e) {
+      console.error(e);
+    } finally {
+      setIsProcessing(false);
+    }
+  };
+
+  const restartDeployment = async () => {
+    if (!confirm("Restart deployment? The robot will re-home to the start position.")) return;
+    setIsProcessing(true);
+    try {
+      await deployApi.restart();
+      speak("Restarting deployment");
+    } catch (e: unknown) {
+      console.error(e);
+      alert(`Restart failed: ${e instanceof Error ? e.message : "Unknown error"}`);
+    } finally {
+      setIsProcessing(false);
+    }
+  };
+
   const triggerRetrain = async () => {
     if (!confirm("Start retraining on intervention data?")) return;
     try {
@@ -216,6 +243,37 @@ export default function DeployRuntime({ status, activeCameras, speak, onStopped 
                 >
                   <StopCircle className="w-4 h-4" /> Stop Episode
                 </button>
+              </div>
+            </>
+          )}
+
+          {/* E-STOP / ERROR recovery panel */}
+          {(status?.state === "estop" || status?.state === "error") && (
+            <>
+              <div className="absolute inset-0 border-4 border-red-500 rounded-2xl pointer-events-none" />
+              <div className="absolute inset-0 bg-red-950/30 rounded-2xl pointer-events-none" />
+              <div className="absolute bottom-4 left-1/2 -translate-x-1/2 flex flex-col items-center gap-3 p-5 bg-red-50/95 dark:bg-red-950/95 border border-red-300 dark:border-red-700 rounded-xl shadow-xl backdrop-blur-sm">
+                <p className="text-sm font-semibold text-red-700 dark:text-red-300">
+                  {status?.state === "estop"
+                    ? "Emergency stop activated. Verify the robot is safe before resetting."
+                    : "An error occurred. Check logs, then reset to try again."}
+                </p>
+                <div className="flex gap-3">
+                  <button
+                    onClick={resetFromEstop}
+                    disabled={isProcessing}
+                    className="px-5 py-2.5 bg-amber-500 text-white rounded-lg font-semibold hover:bg-amber-600 disabled:opacity-50 disabled:cursor-not-allowed transition-all flex items-center gap-2 shadow-md"
+                  >
+                    <RefreshCw className="w-4 h-4" /> Reset to Setup
+                  </button>
+                  <button
+                    onClick={stopDeployment}
+                    disabled={isProcessing}
+                    className="px-5 py-2.5 bg-neutral-500 text-white rounded-lg font-semibold hover:bg-neutral-600 disabled:opacity-50 disabled:cursor-not-allowed transition-all flex items-center gap-2 shadow-md"
+                  >
+                    <StopCircle className="w-4 h-4" /> Stop & Close
+                  </button>
+                </div>
               </div>
             </>
           )}
@@ -426,6 +484,15 @@ export default function DeployRuntime({ status, activeCameras, speak, onStopped 
 
         {/* Bottom buttons (when not HIL — inference mode has no episode bar) */}
         <div className="mt-auto space-y-2">
+          {!isHilMode && status?.state === "running" && (
+            <button
+              onClick={restartDeployment}
+              disabled={isProcessing}
+              className="w-full py-2.5 rounded-xl font-semibold text-sm text-blue-700 dark:text-blue-300 bg-blue-50 dark:bg-blue-950/50 border border-blue-200 dark:border-blue-800 hover:bg-blue-100 dark:hover:bg-blue-900/50 transition-all flex items-center justify-center gap-2 disabled:opacity-50"
+            >
+              <RefreshCw className="w-4 h-4" /> Restart Episode
+            </button>
+          )}
           {!isHilMode && (
             <button
               onClick={stopDeployment}

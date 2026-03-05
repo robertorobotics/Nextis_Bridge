@@ -56,6 +56,10 @@ export default function DeploySetup({ policies, arms, onDeployStarted, speak }: 
   const [selectedSarmModel, setSelectedSarmModel] = useState("");
   const [maxEpisodes, setMaxEpisodes] = useState(100);
 
+  // Temporal ensemble (ACT only)
+  const [temporalEnsemble, setTemporalEnsemble] = useState(false);
+  const [temporalEnsembleCoeff, setTemporalEnsembleCoeff] = useState(0.01);
+
   // UI state
   const [error, setError] = useState("");
   const [isStarting, setIsStarting] = useState(false);
@@ -84,6 +88,13 @@ export default function DeploySetup({ policies, arms, onDeployStarted, speak }: 
       setPolicyPreview(null);
     }
   }, [selectedPolicyId]);
+
+  const isActPolicy = policyPreview?.policy_type?.toLowerCase() === "act";
+
+  // Reset temporal ensemble when switching away from ACT
+  useEffect(() => {
+    if (!isActPolicy) setTemporalEnsemble(false);
+  }, [isActPolicy]);
 
   // Auto-selected leaders based on pairings
   const autoSelectedLeaders = useMemo(() => {
@@ -135,6 +146,10 @@ export default function DeploySetup({ policies, arms, onDeployStarted, speak }: 
         safety: { speed_scale: speedScale },
         movement_scale: speedScale,
       };
+
+      if (temporalEnsemble && isActPolicy) {
+        config.temporal_ensemble_override = temporalEnsembleCoeff;
+      }
 
       if (hilEnabled) {
         config.intervention_dataset = interventionDataset;
@@ -281,9 +296,61 @@ export default function DeploySetup({ policies, arms, onDeployStarted, speak }: 
                 <span className="font-medium text-neutral-800 dark:text-zinc-200">{policyPreview.final_loss.toFixed(4)}</span>
               </div>
             )}
+            {isActPolicy && (
+              <div className="flex items-center justify-between">
+                <span className="text-neutral-500 dark:text-zinc-400">Ensemble</span>
+                <span className="text-xs font-medium text-violet-600 dark:text-violet-400">Recommended (ACT)</span>
+              </div>
+            )}
           </div>
         )}
       </section>
+
+      {/* ── B2. Policy Settings (ACT only) ── */}
+      {isActPolicy && (
+        <section className="bg-violet-50 dark:bg-violet-950/20 rounded-xl p-4 border border-violet-200 dark:border-violet-800">
+          <h3 className="text-sm font-bold text-neutral-700 dark:text-zinc-300 flex items-center gap-1.5 mb-3">
+            <Activity className="w-4 h-4 text-violet-500" /> Policy Settings
+          </h3>
+
+          <label className="flex items-start gap-3 cursor-pointer">
+            <input
+              type="checkbox"
+              checked={temporalEnsemble}
+              onChange={(e) => setTemporalEnsemble(e.target.checked)}
+              className="mt-0.5 w-4 h-4 rounded border-violet-300 dark:border-violet-600 text-violet-600 focus:ring-violet-500"
+            />
+            <div>
+              <span className="text-sm font-semibold text-neutral-800 dark:text-zinc-200">
+                Temporal Ensembling
+              </span>
+              <p className="text-xs text-neutral-400 dark:text-zinc-500">
+                Exponential weighting of overlapping action chunks for smoother control (recommended for ACT)
+              </p>
+            </div>
+          </label>
+
+          {temporalEnsemble && (
+            <div className="mt-3 ml-7">
+              <label className="block text-xs font-bold text-violet-700 dark:text-violet-300 mb-1">
+                Ensemble Coefficient
+              </label>
+              <input
+                type="number"
+                value={temporalEnsembleCoeff}
+                onChange={(e) => setTemporalEnsembleCoeff(parseFloat(e.target.value) || 0.01)}
+                min={0.001}
+                max={1.0}
+                step={0.001}
+                className="w-full px-3 py-2 bg-white dark:bg-zinc-800 border border-violet-200 dark:border-violet-700 rounded-lg text-sm text-neutral-900 dark:text-zinc-100 focus:outline-none focus:ring-2 focus:ring-violet-500"
+              />
+              <p className="text-xs text-neutral-400 dark:text-zinc-500 mt-1">
+                Lower = smoother (recommended: 0.01). Sets action_steps=1 automatically.
+              </p>
+            </div>
+          )}
+        </section>
+      )}
 
       {/* ── C. Safety Panel ── */}
       <section className="bg-neutral-50 dark:bg-zinc-800/50 rounded-xl p-4 border border-neutral-100 dark:border-zinc-700">

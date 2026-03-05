@@ -29,6 +29,7 @@ from app.routes import (  # noqa: E402
     recording,
     rl,
     system,
+    tablet,
     teleop,
     tools,
     training,
@@ -39,14 +40,15 @@ app = FastAPI(title="Nextis Robotics API")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origin_regex=r"https?://(localhost|192\.168\.\d+\.\d+|10\.\d+\.\d+\.\d+|100\.\d+\.\d+\.\d+)(:\d+)?",
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 for r in [system, arms, motors, calibration, teleop, cameras,
-          recording, datasets, training, policies, hil, rl, chat, debug, tools, deploy]:
+          recording, datasets, training, policies, hil, rl, chat, debug, tools, deploy,
+          tablet]:
     app.include_router(r.router)
 
 

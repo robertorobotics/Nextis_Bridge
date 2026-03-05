@@ -1,5 +1,6 @@
 from fastapi import APIRouter, Request
 
+from app.core.hardware.types import ConnectionStatus
 from app.dependencies import get_state
 
 router = APIRouter(tags=["teleop"])
@@ -15,6 +16,16 @@ async def start_teleop(request: Request):
 
     force = data.get("force", False)
     active_arms = data.get("active_arms", None)
+
+    # Auto-select all connected arms when none specified (e.g. tablet)
+    if active_arms is None and system.arm_registry:
+        active_arms = [
+            arm_id
+            for arm_id, status in system.arm_registry.arm_status.items()
+            if status == ConnectionStatus.CONNECTED
+        ]
+        if not active_arms:
+            return {"status": "error", "message": "No arms connected"}
 
     # Lazy Initialize Teleop Service if needed
     if not system.teleop_service:

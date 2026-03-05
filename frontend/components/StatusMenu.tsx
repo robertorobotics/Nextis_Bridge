@@ -150,7 +150,7 @@ export default function StatusMenu({ onOpenArmManager }: StatusMenuProps) {
             onClick={() => setIsStatusMenuOpen(false)}
           />
 
-          <div className="absolute top-12 right-0 w-64 bg-white/90 dark:bg-zinc-900/90 backdrop-blur-xl border border-white/50 dark:border-zinc-700/50 shadow-2xl rounded-2xl p-4 z-50 animate-in fade-in slide-in-from-top-2 flex flex-col gap-2">
+          <div className="absolute top-12 right-0 w-64 max-w-[calc(100vw-2rem)] bg-white/90 dark:bg-zinc-900/90 backdrop-blur-xl border border-white/50 dark:border-zinc-700/50 shadow-2xl rounded-2xl p-4 z-50 animate-in fade-in slide-in-from-top-2 flex flex-col gap-2">
             <div className="flex items-center justify-between mb-2">
               <span className="text-[10px] font-bold text-neutral-400 dark:text-zinc-500 uppercase tracking-widest">
                 System Control
