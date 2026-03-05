@@ -292,7 +292,7 @@ def recording_capture_loop(svc):
                 action = {}
                 obs = {}
 
-                # SOURCE 1: Get motor positions from teleop cache (FAST - no hardware read)
+                # SOURCE 1a: LEADER positions → action (the human intent)
                 # Filter using pairing-based key sets (leader exclusion + follower allowlist)
                 use_pairing_filter = bool(leader_keys) or allowed_keys is not None
                 with svc._action_lock:
@@ -301,18 +301,43 @@ def recording_capture_loop(svc):
                             base = key.split(".")[0] if "." in key else key
                             if use_pairing_filter:
                                 if base in leader_keys:
-                                    continue  # SAFETY: never record leader data
+                                    continue
                                 if allowed_keys is not None and base not in allowed_keys:
                                     continue
                             else:
-                                # Legacy prefix filter
                                 if svc._selected_arms is not None:
                                     if key.startswith("left_") and "left" not in svc._selected_arms:
                                         continue
                                     elif key.startswith("right_") and "right" not in svc._selected_arms:
                                         continue
                             action[key] = val
+
+                # SOURCE 1b: FOLLOWER positions → observation (the robot reality)
+                with svc._follower_obs_lock:
+                    if svc._latest_follower_obs:
+                        for key, val in svc._latest_follower_obs.items():
+                            base = key.split(".")[0] if "." in key else key
+                            if use_pairing_filter:
+                                if base in leader_keys:
+                                    continue
+                                if allowed_keys is not None and base not in allowed_keys:
+                                    continue
+                            else:
+                                if svc._selected_arms is not None:
+                                    if key.startswith("left_") and "left" not in svc._selected_arms:
+                                        continue
+                                    elif key.startswith("right_") and "right" not in svc._selected_arms:
+                                        continue
                             obs[key] = val
+
+                # Fallback: if follower cache not yet populated, use leader as obs
+                # (first few frames before Damiao MIT response arrives)
+                if not any('.pos' in k for k in obs) and action:
+                    for k, v in action.items():
+                        if k not in obs:
+                            obs[k] = v
+                    if svc._recording_frame_counter == 0:
+                        print("[REC CAPTURE] WARNING: Using leader positions as obs fallback (follower cache empty)")
 
                 # SOURCE 1b: Extended motor state (velocity + torque) from follower robot
                 # These come from the MIT response cache, NOT from the leader action cache
@@ -405,9 +430,14 @@ def recording_capture_loop(svc):
                 has_camera_data = any(hasattr(obs.get(k), 'shape') for k in obs.keys())
 
                 if svc._recording_frame_counter == 0:
-                    print(f"[REC CAPTURE] Data: motors={has_motor_data}, cameras={has_camera_data}")
-                    print(f"[REC CAPTURE] obs keys: {list(obs.keys())}")
-                    print(f"[REC CAPTURE] action keys: {list(action.keys())}")
+                    print(f"[REC CAPTURE] action keys ({len(action)}): {list(action.keys())}")
+                    print(f"[REC CAPTURE] obs keys ({len(obs)}): {list(obs.keys())}")
+                    # Show the delta between leader and follower to verify gravity offset
+                    for key in action:
+                        if key in obs:
+                            delta = action[key] - obs[key]
+                            if abs(delta) > 0.01:
+                                print(f"[REC CAPTURE] leader-follower delta: {key} = {delta:+.4f} rad")
 
                 # Need at least motor data OR camera data
                 if not has_motor_data and not has_camera_data:
@@ -694,8 +724,10 @@ def start_recording_session(
         if tool_features:
             filtered_obs_features.update(tool_features)
 
-        print(f"[START_SESSION] Filtered obs features: {list(filtered_obs_features.keys())}")
-        print(f"[START_SESSION] Filtered action features: {list(filtered_action_features.keys())}")
+        print(f"[START_SESSION] Action features ({len(filtered_action_features)}): {list(filtered_action_features.keys())}")
+        print(f"[START_SESSION] Obs features ({len(filtered_obs_features)}): {list(filtered_obs_features.keys())}")
+        print(f"[START_SESSION] Action source: LEADER positions")
+        print(f"[START_SESSION] Obs source: FOLLOWER positions + vel + tau")
 
         features = combine_feature_dicts(
             hw_to_dataset_features(filtered_obs_features, prefix=OBS_STR, use_video=True),

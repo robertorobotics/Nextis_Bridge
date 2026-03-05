@@ -54,17 +54,19 @@ def refresh_metadata_from_disk(svc):
     Called AFTER external operations like delete_episode().
     Assumes sync_to_disk() was called BEFORE the external operation.
 
-    Resets ALL stale state:
-    - latest_episode: Used by _save_episode_metadata() to compute frame indices
-    - _current_file_start_frame: Tracks current parquet file position
-    - episodes DataFrame: Cached episode metadata
-    - metadata_buffer: Cleared to prevent ghost episodes
+    CRITICAL: We reload meta.episodes from disk (via load_episodes) rather than
+    setting it to None. When latest_episode is None but meta.episodes is loaded,
+    LeRobot's _save_episode_data/_save_episode_metadata enter their resumption
+    path which calls update_chunk_file_indices() — creating NEW parquet files
+    instead of overwriting the existing ones. Setting episodes=None caused both
+    branches to default to chunk=0/file=0, destroying all prior data.
     """
     if not svc.dataset or not svc.session_active:
         print("[REFRESH] Skipped (no dataset or session not active)")
         return
 
     import json
+    from lerobot.datasets.utils import load_episodes
 
     info_path = svc.dataset.meta.root / "meta" / "info.json"
     print(f"[REFRESH] Reading from: {info_path}")
@@ -79,49 +81,44 @@ def refresh_metadata_from_disk(svc):
 
             print(f"[REFRESH] Disk: {disk_count}, Memory: {old_memory_count}")
 
-            # 1. Update info dict
+            # 1. Update info dict from disk
             svc.dataset.meta.info["total_episodes"] = disk_count
             svc.dataset.meta.info["total_frames"] = disk_info.get("total_frames", 0)
 
-            # Verify the update worked
             verify_count = svc.dataset.meta.total_episodes
             print(f"[REFRESH] After update: meta.total_episodes = {verify_count}")
             if verify_count != disk_count:
                 print(f"[REFRESH] ERROR: Update failed! Expected {disk_count}, got {verify_count}")
 
-            # 2. Reset latest_episode to force fresh index calculation
-            if hasattr(svc.dataset, 'meta'):
-                svc.dataset.meta.latest_episode = None
-                # Clear metadata buffer (should be empty after sync_to_disk, but ensure it)
-                if hasattr(svc.dataset.meta, 'metadata_buffer'):
-                    svc.dataset.meta.metadata_buffer = []
+            # 2. Reset latest_episode so LeRobot enters the resumption path
+            svc.dataset.meta.latest_episode = None
             if hasattr(svc.dataset, 'latest_episode'):
                 svc.dataset.latest_episode = None
 
-            # 3. Reset current file tracking
-            if hasattr(svc.dataset, '_current_file_start_frame'):
-                svc.dataset._current_file_start_frame = None
+            # 3. Clear metadata buffer (should be empty after sync_to_disk)
+            if hasattr(svc.dataset.meta, 'metadata_buffer'):
+                svc.dataset.meta.metadata_buffer = []
 
-            # 4. Reset episodes to None - DON'T reload from parquet
-            # LeRobot expects episodes to be a specific internal structure (not a raw DataFrame)
-            # Setting to None forces LeRobot to start fresh when latest_episode is also None
-            svc.dataset.meta.episodes = None
+            # 4. CRITICAL: Reload episodes from disk instead of setting to None.
+            #    This enables LeRobot's resumption logic in _save_episode_data and
+            #    _save_episode_metadata to create new parquet files (via
+            #    update_chunk_file_indices) instead of overwriting chunk-000/file-000.
+            try:
+                svc.dataset.meta.episodes = load_episodes(svc.dataset.meta.root)
+                ep_count = len(svc.dataset.meta.episodes) if svc.dataset.meta.episodes else 0
+                print(f"[REFRESH] Reloaded {ep_count} episodes from disk")
+            except Exception as e:
+                print(f"[REFRESH] WARNING: Could not reload episodes: {e}")
+                svc.dataset.meta.episodes = None
 
-            # 5. CRITICAL: Clear episode_buffer to force fresh creation on next start_episode()
-            # Without this, stale buffer with old episode_index causes validation failure
+            # 5. Clear episode_buffer for fresh creation on next start_episode()
             if hasattr(svc.dataset, 'episode_buffer') and svc.dataset.episode_buffer is not None:
                 svc.dataset.episode_buffer = None
                 print("[REFRESH] Cleared stale episode_buffer")
 
-            # 6. Close and reset data writer to prevent stale frame counting
-            if hasattr(svc.dataset, '_close_writer'):
-                try:
-                    svc.dataset._close_writer()
-                    print("[REFRESH] Closed data writer")
-                except Exception:
-                    pass
-            if hasattr(svc.dataset, 'writer'):
-                svc.dataset.writer = None
+            # 6. Data writer: already closed by sync_to_disk(). LeRobot's resumption
+            #    logic will create a new writer at the next file index, preserving
+            #    existing data. _current_file_start_frame is reset by resumption.
 
             # 7. Sync local episode counter
             svc.episode_count = disk_count

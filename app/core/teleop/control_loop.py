@@ -412,11 +412,19 @@ def teleop_loop(svc, ctx: PairingContext):
                                             0.0, 1.0,
                                         )
                                     follower_motors[f"{k}.pos"] = v
-                                with svc._action_lock:
-                                    svc._latest_leader_action = follower_motors.copy()
-                            elif leader_action:
+                                with svc._follower_obs_lock:
+                                    svc._latest_follower_obs = follower_motors.copy()
+
+                            # LEADER ACTION: the human's commanded intent (already in follower
+                            # coordinate space after joint mapping in section 2a above)
+                            if leader_action:
                                 with svc._action_lock:
                                     svc._latest_leader_action = leader_action.copy()
+                            elif cached:
+                                # Fallback: if leader read failed this frame, use follower as
+                                # approximate action (better than stale data)
+                                with svc._action_lock:
+                                    svc._latest_leader_action = follower_motors.copy()
                         else:
                             # Non-Damiao (Feetech/Dynamixel): sync_read is passive,
                             # safe to call get_observation() with retry.
@@ -442,11 +450,17 @@ def teleop_loop(svc, ctx: PairingContext):
                             if follower_obs:
                                 follower_motors = {k: v for k, v in follower_obs.items() if '.pos' in k}
                                 if follower_motors:
-                                    with svc._action_lock:
-                                        svc._latest_leader_action = follower_motors.copy()
-                            elif leader_action:
+                                    with svc._follower_obs_lock:
+                                        svc._latest_follower_obs = follower_motors.copy()
+
+                            if leader_action:
                                 with svc._action_lock:
                                     svc._latest_leader_action = leader_action.copy()
+                            elif follower_obs:
+                                follower_motors = {k: v for k, v in follower_obs.items() if '.pos' in k}
+                                if follower_motors:
+                                    with svc._action_lock:
+                                        svc._latest_leader_action = follower_motors.copy()
                     elif leader_action:
                         # Not recording: use leader action directly as cached action
                         # (no need to read follower positions over CAN)

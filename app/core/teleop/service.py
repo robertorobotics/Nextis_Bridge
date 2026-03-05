@@ -146,6 +146,8 @@ class TeleoperationService:
         # Shared action state for recording thread
         self._latest_leader_action = {}
         self._action_lock = threading.Lock()
+        self._latest_follower_obs: dict = {}
+        self._follower_obs_lock = threading.Lock()
 
         # Recording capture thread (separate from teleop loop)
         self._recording_capture_thread = None

@@ -237,6 +237,13 @@ def delete_last_episode():
         result = system.dataset_service.delete_episode(repo_id, last_index)
         print(f"[DELETE_LAST] delete_episode returned: {result}")
 
+        # Remove orphaned frames from deleted episode so dataset_from/to indices stay accurate
+        try:
+            consolidate_result = system.dataset_service.consolidate_dataset(repo_id)
+            print(f"[DELETE_LAST] consolidate returned: {consolidate_result}")
+        except Exception as ce:
+            print(f"[DELETE_LAST] WARNING: consolidation failed (non-fatal): {ce}")
+
         # Refresh metadata from disk AFTER deletion to reload clean state
         system.teleop_service.refresh_metadata_from_disk()
 
