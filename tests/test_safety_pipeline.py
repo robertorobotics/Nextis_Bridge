@@ -468,3 +468,144 @@ def test_periodic_debug_logging(basic_config, caplog):
         for _ in range(30):
             pipe.process({"base": 0.01}, obs, dt=1 / 60)
     assert any("Safety[30]" in msg for msg in caplog.messages)
+
+
+# ---------------------------------------------------------------------------
+# 20. Trajectory-based velocity limiting — torque buildup
+# ---------------------------------------------------------------------------
+
+
+def test_trajectory_ramp_builds_position_error(basic_config):
+    """Over multiple frames with static observation, filtered target ramps
+    away from observation, building up position error (MIT restoring torque).
+
+    This simulates a motor that can't track due to gravity: the observation
+    stays put while the trajectory reference (prev_output) advances.
+    """
+    basic_config.smoothing_alpha = 1.0  # no EMA
+    pipe = SafetyPipeline(basic_config)
+
+    obs = {"base": 0.0}           # motor stays at 0 (gravity)
+    action = {"base": 1.0}        # policy target far away
+    dt = 1 / 60
+    max_delta = 1.5 * dt          # J8009P: 1.5 rad/s
+
+    # Run 20 frames with the same static observation
+    results = []
+    for _ in range(20):
+        result = pipe.process(action, obs, dt=dt)
+        results.append(result["base"])
+
+    # Frame 1: filtered = obs + max_delta = 0.025
+    # Frame 2: filtered = prev_output + max_delta = 0.050
+    # Frame N: filtered ≈ N * max_delta (until position error cap)
+    # Position error (filtered - obs) must grow over time
+    assert results[0] == pytest.approx(max_delta, abs=1e-6)
+    assert results[4] > results[0]     # growing over time
+    assert results[9] > results[4]     # still growing
+    # At frame 20: ~20 * 0.025 = 0.5, but capped by max_position_error
+    assert results[19] <= 0.5 + 1e-6   # J8009P cap = 0.5
+
+
+# ---------------------------------------------------------------------------
+# 21. Max position error cap
+# ---------------------------------------------------------------------------
+
+
+def test_position_error_cap_limits_torque(basic_config):
+    """Filtered target can never exceed max_position_error from observation,
+    even after many frames of ramping.
+    """
+    basic_config.smoothing_alpha = 1.0  # no EMA
+    pipe = SafetyPipeline(basic_config)
+
+    obs = {"base": 0.0}           # motor stuck at 0
+    action = {"base": 5.0}        # target very far
+    dt = 1 / 60
+
+    # Run enough frames for trajectory to exceed cap (0.5 / 0.025 = 20 frames)
+    for _ in range(100):
+        result = pipe.process(action, obs, dt=dt)
+
+    # J8009P max position error = 0.5 rad
+    # Filtered must not exceed obs + max_error
+    assert result["base"] <= 0.5 + 1e-6
+    assert result["base"] >= 0.5 - 0.05  # should be AT the cap
+
+
+def test_position_error_cap_per_motor_type(basic_config):
+    """Different motor types have different position error caps."""
+    basic_config.smoothing_alpha = 1.0
+    pipe = SafetyPipeline(basic_config)
+
+    obs = {"base": 0.0, "link1": 0.0}  # base=J8009P, link1=J4340P
+    action = {"base": 5.0, "link1": 5.0}
+    dt = 1 / 60
+
+    for _ in range(200):
+        result = pipe.process(action, obs, dt=dt)
+
+    # J8009P cap = 0.5, J4340P cap = 0.4
+    assert result["base"] <= 0.5 + 1e-6
+    assert result["link1"] <= 0.4 + 1e-6
+
+
+# ---------------------------------------------------------------------------
+# 22. Direction reversal
+# ---------------------------------------------------------------------------
+
+
+def test_direction_reversal_ramps_correctly(basic_config):
+    """When policy target reverses direction, trajectory eventually follows.
+
+    Note: the acceleration filter (stage 3) legitimately slows down
+    velocity reversals, so the output may continue in the old direction
+    briefly before turning around.  We disable stage 3 to test the
+    velocity limiter in isolation, then test the full pipeline
+    with a longer horizon.
+    """
+    # Test velocity limiter alone (disable acceleration + EMA)
+    basic_config.smoothing_alpha = 1.0
+    basic_config.disable_smoothing = True
+    pipe = SafetyPipeline(basic_config)
+
+    obs = {"base": 0.0}
+    dt = 1 / 60
+
+    # Ramp UP for 10 frames
+    for _ in range(10):
+        result = pipe.process({"base": 1.0}, obs, dt=dt)
+    peak = result["base"]
+    assert peak > 0.1
+
+    # Now reverse: target at -1.0.  With smoothing disabled,
+    # every frame should decrease (velocity limiter ramps down).
+    prev = peak
+    for _ in range(5):
+        result = pipe.process({"base": -1.0}, obs, dt=dt)
+        assert result["base"] <= prev + 1e-9
+        prev = result["base"]
+
+    assert result["base"] < peak
+
+
+def test_direction_reversal_with_accel_filter(basic_config):
+    """Full pipeline (accel filter enabled): reversal takes longer but
+    the output eventually moves toward the new target.
+    """
+    basic_config.smoothing_alpha = 1.0  # no EMA but accel filter ON
+    pipe = SafetyPipeline(basic_config)
+
+    obs = {"base": 0.0}
+    dt = 1 / 60
+
+    # Ramp UP for 10 frames
+    for _ in range(10):
+        result = pipe.process({"base": 1.0}, obs, dt=dt)
+    peak = result["base"]
+
+    # Reverse for 30 frames — eventually should move below peak
+    for _ in range(30):
+        result = pipe.process({"base": -1.0}, obs, dt=dt)
+
+    assert result["base"] < peak

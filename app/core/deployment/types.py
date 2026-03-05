@@ -69,6 +69,23 @@ DEFAULT_VELOCITY_LIMITS: Dict[str, float] = {
 FALLBACK_VELOCITY_LIMIT: float = 2.0
 
 # ---------------------------------------------------------------------------
+# Max position error (filtered_target - observation) in rad.
+# Caps MIT restoring torque to prevent damage when motor is blocked.
+# Derived from: motor continuous torque / kp gain
+#   J8009P: ~14 Nm safe / 30 kp ≈ 0.47 → 0.5 (15 Nm, within 35 Nm peak)
+#   J4340P: ~13 Nm safe / 30 kp ≈ 0.43 → 0.4 (12 Nm, within 27 Nm peak)
+#   J4310:  ~8.75 Nm safe / 15 kp ≈ 0.58 → 0.4 (6 Nm, within 12.5 Nm peak)
+# ---------------------------------------------------------------------------
+
+DEFAULT_MAX_POSITION_ERROR: Dict[str, float] = {
+    "J8009P": 0.5,
+    "J4340P": 0.4,
+    "J4310": 0.4,
+    "STS3215": 0.2,   # Position servo — keep tight
+}
+FALLBACK_MAX_POSITION_ERROR: float = 0.3
+
+# ---------------------------------------------------------------------------
 # Safety presets by policy type
 # ---------------------------------------------------------------------------
 

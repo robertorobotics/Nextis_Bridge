@@ -283,6 +283,56 @@ def resume_deployment():
         return JSONResponse(status_code=500, content={"error": str(e)})
 
 
+@router.post("/deploy/reset")
+def reset_deployment():
+    """Reset from ESTOP or ERROR back to IDLE.
+
+    After reset, the user can start a new deployment from the setup screen.
+    """
+    system = get_state()
+    if not system.deployment_runtime:
+        return JSONResponse(status_code=503, content={"error": "Deployment runtime not initialized"})
+
+    try:
+        success = system.deployment_runtime.reset()
+        if success:
+            return {"status": "reset_to_idle"}
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error": f"Cannot reset from state: {system.deployment_runtime._state.value}. "
+                "Reset is only available from ESTOP or ERROR states."
+            },
+        )
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+
+@router.post("/deploy/restart")
+def restart_deployment():
+    """Stop current deployment and restart with the same configuration.
+
+    The robot will re-home to the leader position before policy
+    execution resumes.
+    """
+    system = get_state()
+    if not system.deployment_runtime:
+        return JSONResponse(status_code=503, content={"error": "Deployment runtime not initialized"})
+
+    try:
+        system.deployment_runtime.restart()
+        status = system.deployment_runtime.get_status()
+        return {
+            "status": "restarted",
+            "state": status.state.value,
+            "mode": status.mode.value,
+        }
+    except RuntimeError as e:
+        return JSONResponse(status_code=400, content={"error": str(e)})
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+
 @router.post("/deploy/estop")
 def estop_deployment():
     """Trigger emergency stop on the deployment runtime."""

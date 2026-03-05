@@ -1591,3 +1591,177 @@ class TestDryRun:
         # Without return_raw
         result = runtime._get_policy_action({})
         assert result is None
+
+
+# ---------------------------------------------------------------------------
+# reset() tests
+# ---------------------------------------------------------------------------
+
+
+class TestReset:
+    """Tests for DeploymentRuntime.reset() recovery from terminal states."""
+
+    def test_reset_from_estop_transitions_to_idle(self, runtime):
+        runtime._state = RuntimeState.ESTOP
+        pipeline = MagicMock()
+        runtime._safety_pipeline = pipeline
+        runtime._stop_event = threading.Event()
+
+        result = runtime.reset()
+
+        assert result is True
+        assert runtime._state == RuntimeState.IDLE
+        pipeline.clear_estop.assert_called_once()
+        pipeline.reset.assert_called_once()
+
+    def test_reset_from_error_transitions_to_idle(self, runtime):
+        runtime._state = RuntimeState.ERROR
+        runtime._safety_pipeline = MagicMock()
+        runtime._stop_event = threading.Event()
+
+        result = runtime.reset()
+
+        assert result is True
+        assert runtime._state == RuntimeState.IDLE
+
+    def test_reset_from_running_rejected(self, runtime):
+        runtime._state = RuntimeState.RUNNING
+
+        result = runtime.reset()
+
+        assert result is False
+        assert runtime._state == RuntimeState.RUNNING
+
+    def test_reset_from_idle_rejected(self, runtime):
+        runtime._state = RuntimeState.IDLE
+
+        result = runtime.reset()
+
+        assert result is False
+
+    def test_reset_clears_per_session_objects(self, runtime):
+        runtime._state = RuntimeState.ESTOP
+        runtime._policy = MagicMock()
+        runtime._safety_pipeline = MagicMock()
+        runtime._obs_builder = MagicMock()
+        runtime._intervention_detector = MagicMock()
+        runtime._checkpoint_path = "/some/path"
+        runtime._policy_config = MagicMock()
+        runtime._config = MagicMock()
+        runtime._stop_event = threading.Event()
+
+        runtime.reset()
+
+        assert runtime._policy is None
+        assert runtime._obs_builder is None
+        assert runtime._safety_pipeline is None
+        assert runtime._intervention_detector is None
+        assert runtime._checkpoint_path is None
+        assert runtime._policy_config is None
+        assert runtime._config is None
+        assert runtime._loop_thread is None
+
+    def test_reset_calls_policy_reset(self, runtime):
+        runtime._state = RuntimeState.ESTOP
+        runtime._safety_pipeline = MagicMock()
+        runtime._stop_event = threading.Event()
+        policy = MagicMock()
+        runtime._policy = policy
+
+        runtime.reset()
+
+        policy.reset.assert_called_once()
+
+    def test_reset_joins_loop_thread(self, runtime):
+        runtime._state = RuntimeState.ERROR
+        runtime._safety_pipeline = MagicMock()
+        runtime._stop_event = threading.Event()
+        mock_thread = MagicMock()
+        mock_thread.is_alive.return_value = True
+        runtime._loop_thread = mock_thread
+
+        runtime.reset()
+
+        mock_thread.join.assert_called_once_with(timeout=5.0)
+
+
+# ---------------------------------------------------------------------------
+# restart() tests
+# ---------------------------------------------------------------------------
+
+
+class TestRestart:
+    """Tests for DeploymentRuntime.restart() (stop + start with same config)."""
+
+    def test_restart_calls_stop_then_start(self, runtime):
+        config = DeploymentConfig(
+            mode=DeploymentMode.INFERENCE,
+            policy_id="test-policy",
+            safety=SafetyConfig(),
+        )
+        runtime._state = RuntimeState.RUNNING
+        runtime._config = config
+        runtime._active_arm_ids = ["follower_left"]
+        runtime.stop = MagicMock()
+        runtime.start = MagicMock()
+
+        runtime.restart()
+
+        runtime.stop.assert_called_once()
+        runtime.start.assert_called_once_with(config, ["follower_left"])
+
+    def test_restart_from_idle_raises(self, runtime):
+        runtime._state = RuntimeState.IDLE
+
+        with pytest.raises(RuntimeError, match="no active deployment"):
+            runtime.restart()
+
+    def test_restart_without_config_raises(self, runtime):
+        runtime._state = RuntimeState.RUNNING
+        runtime._config = None
+
+        with pytest.raises(RuntimeError, match="no saved configuration"):
+            runtime.restart()
+
+    def test_restart_preserves_config_across_stop(self, runtime):
+        """restart() must capture config BEFORE stop() clears it."""
+        config = DeploymentConfig(
+            mode=DeploymentMode.INFERENCE,
+            policy_id="my-policy",
+            safety=SafetyConfig(),
+        )
+        runtime._state = RuntimeState.RUNNING
+        runtime._config = config
+        runtime._active_arm_ids = ["follower_left", "follower_right"]
+
+        captured = {}
+
+        def mock_start(cfg, arm_ids):
+            captured["config"] = cfg
+            captured["arms"] = arm_ids
+
+        runtime.stop = MagicMock()
+        runtime.start = mock_start
+
+        runtime.restart()
+
+        assert captured["config"] is config
+        assert captured["arms"] == ["follower_left", "follower_right"]
+
+    def test_restart_from_estop(self, runtime):
+        """restart() should work from any non-IDLE state."""
+        config = DeploymentConfig(
+            mode=DeploymentMode.INFERENCE,
+            policy_id="test-policy",
+            safety=SafetyConfig(),
+        )
+        runtime._state = RuntimeState.ESTOP
+        runtime._config = config
+        runtime._active_arm_ids = ["follower_left"]
+        runtime.stop = MagicMock()
+        runtime.start = MagicMock()
+
+        runtime.restart()
+
+        runtime.stop.assert_called_once()
+        runtime.start.assert_called_once()

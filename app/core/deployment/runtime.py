@@ -76,6 +76,8 @@ class DeploymentRuntime:
 
         # Dry-run diagnostics log (populated during dry_run=True)
         self._dry_run_log: list = []
+        # Whether follower supports zero-overhead cached observations
+        self._use_cached_obs: bool = False
 
         # Post-pre-position snapshot for drift detection
         self._post_preposition_positions: Dict[str, float] = {}
@@ -187,11 +189,26 @@ class DeploymentRuntime:
                         and hasattr(self._follower.config, "record_extended_state")
                     ):
                         self._follower.config.record_extended_state = True
-                        logger.warning(
-                            "DEPLOY: Auto-enabled extended observation on follower "
-                            "(policy trained with %d states including vel/tau)",
-                            len(state_names),
-                        )
+                        # Verify: count scalar keys from a test observation
+                        try:
+                            test_obs = self._follower.get_observation_cached()
+                            scalar_keys = sorted(
+                                k
+                                for k, v in test_obs.items()
+                                if isinstance(v, (int, float))
+                            )
+                            logger.warning(
+                                "DEPLOY: Extended observation enabled — "
+                                "%d scalar keys: %s",
+                                len(scalar_keys),
+                                scalar_keys,
+                            )
+                        except Exception:
+                            logger.warning(
+                                "DEPLOY: Auto-enabled extended observation on follower "
+                                "(policy trained with %d states including vel/tau)",
+                                len(state_names),
+                            )
                     else:
                         logger.warning(
                             "DEPLOY CRITICAL: Policy expects extended state (vel/tau) "
@@ -334,26 +351,81 @@ class DeploymentRuntime:
     def reset(self) -> bool:
         """Reset from ESTOP or ERROR back to IDLE.
 
-        Clears safety pipeline state.  Caller should verify physical safety
-        before calling.
+        Stops the control loop thread, clears all pipeline state, and
+        releases per-session resources.  Caller should verify physical
+        safety before calling.
         """
         if self._state not in (RuntimeState.ESTOP, RuntimeState.ERROR):
             return False
+
+        old_state = self._state
 
         self._stop_event.set()
         if self._loop_thread and self._loop_thread.is_alive():
             self._loop_thread.join(timeout=5.0)
 
+        # Reset pipeline and policy state before clearing references
         if self._safety_pipeline:
             self._safety_pipeline.clear_estop()
             self._safety_pipeline.reset()
+        if self._intervention_detector:
+            self._intervention_detector.reset()
+        if self._policy and hasattr(self._policy, "reset"):
+            self._policy.reset()
 
-        # Force transition (ESTOP/ERROR have no valid transitions in the table,
-        # but reset is the explicit escape hatch)
+        # Release per-session resources so start() can reinitialize
+        self._policy = None
+        self._checkpoint_path = None
+        self._policy_config = None
+        self._obs_builder = None
+        self._safety_pipeline = None
+        self._intervention_detector = None
+        self._leader = None
+        self._follower = None
+        self._arm_defs = []
+        self._config = None
+        self._loop_thread = None
+        self._dry_run_log = []
+
+        # Force transition (ESTOP/ERROR have no valid transitions in the
+        # table; reset() is the explicit escape hatch)
         with self._state_lock:
             self._state = RuntimeState.IDLE
-        logger.info("Deployment reset from %s to IDLE", self._state.value)
+        logger.info("Deployment reset from %s to IDLE", old_state.value)
         return True
+
+    def restart(self) -> None:
+        """Stop the current deployment and restart with the same configuration.
+
+        Performs a full stop (thread join, cleanup), then re-starts with
+        the saved config and arm IDs.  The robot is re-homed to the leader
+        position before policy execution resumes.
+
+        Raises:
+            RuntimeError: If no active deployment or restart fails.
+        """
+        if self._state == RuntimeState.IDLE:
+            raise RuntimeError("Cannot restart: no active deployment")
+
+        # Capture config and arm IDs before stop() clears them
+        saved_config = self._config
+        saved_arm_ids = list(self._active_arm_ids)
+
+        if saved_config is None:
+            raise RuntimeError("Cannot restart: no saved configuration")
+
+        logger.info(
+            "Restarting deployment (mode=%s, policy=%s)...",
+            saved_config.mode.value,
+            saved_config.policy_id,
+        )
+
+        # Full stop — joins thread, resets pipelines, clears state → IDLE
+        self.stop()
+
+        # Re-start with same config (policy load, pre-position, new thread)
+        self.start(saved_config, saved_arm_ids)
+        logger.info("Deployment restarted successfully")
 
     def estop(self) -> bool:
         """Emergency stop — hold position immediately."""
@@ -423,33 +495,29 @@ class DeploymentRuntime:
             )
         logger.info("Control loop running at %dHz", loop_hz)
 
+        # Detect cached observation support (class-level flag, immune to MagicMock)
+        use_cached = (
+            getattr(self._follower, "_supports_cached_observation", False) is True
+        )
+        self._use_cached_obs = use_cached
+
+        if use_cached:
+            logger.info(
+                "Control loop observation: cached (no torque interruption)"
+            )
+        else:
+            logger.warning(
+                "Control loop observation: sync_read (sends zero-torque probes "
+                "— consider adding get_observation_cached() to follower)"
+            )
+
         # Reset policy state at loop entry (belt-and-suspenders with start())
         if self._policy and hasattr(self._policy, "reset"):
             self._policy.reset()
 
-        # Log positions at policy start and check for drift
-        self._log_follower_positions("policy start")
-        if self._post_preposition_positions:
-            try:
-                obs = self._follower.get_observation() if self._follower else {}
-                for key, prev in self._post_preposition_positions.items():
-                    current = obs.get(key)
-                    if current is not None and abs(current - prev) > 0.05:
-                        logger.warning(
-                            "DEPLOY DRIFT: %s moved %.4f rad during loading gap "
-                            "(%.4f → %.4f)",
-                            key,
-                            current - prev,
-                            prev,
-                            current,
-                        )
-            except Exception:
-                pass
-
-        # Restore velocity_limit that was deferred from pre-position.
-        # Kept at PRE_POSITION_VEL during the gap to prevent rate-limiter
-        # bypass; now safe to restore because the control loop will send
-        # motor commands every frame.
+        # Restore velocity_limit FIRST — before any other startup work.
+        # The control loop will send motor commands every frame, so the
+        # full velocity budget is needed for the first policy action.
         if self._pre_position_old_vel is not None:
             try:
                 from lerobot.motors.damiao.damiao import DamiaoMotorsBus
@@ -464,6 +532,70 @@ class DeploymentRuntime:
             except Exception:
                 pass
             self._pre_position_old_vel = None
+
+        # Log actual bus velocity_limit for diagnostics
+        _bus = getattr(self._follower, "bus", None)
+        if _bus and hasattr(_bus, "velocity_limit"):
+            logger.warning(
+                "DEPLOY: Bus velocity_limit at control loop start: %.3f",
+                _bus.velocity_limit,
+            )
+
+        # Write deployment logs to a file for post-deployment analysis
+        from pathlib import Path as _Path
+
+        _log_dir = _Path("deployment_logs")
+        _log_dir.mkdir(exist_ok=True)
+        _log_file = _log_dir / f"deploy_{int(time.time())}.log"
+        _file_handler = logging.FileHandler(_log_file)
+        _file_handler.setLevel(logging.WARNING)
+        _file_handler.setFormatter(
+            logging.Formatter("%(asctime)s %(name)s %(levelname)s %(message)s")
+        )
+        logging.getLogger("app.core.deployment").addHandler(_file_handler)
+        logger.warning("DEPLOY: Logging to %s", _log_file)
+        self._deploy_file_handler = _file_handler
+
+        # Ensure MIT position cache is seeded for cached observations.
+        # Pre-positioning should have done this via send_action(), but verify.
+        if use_cached:
+            try:
+                bus = getattr(self._follower, "bus", None)
+                if bus and hasattr(bus, "read_cached_positions"):
+                    if not bus.read_cached_positions():
+                        logger.warning(
+                            "DEPLOY: MIT cache empty at control loop start — "
+                            "doing one sync_read to seed it"
+                        )
+                        self._follower.get_observation()
+            except Exception:
+                pass
+
+        # Log positions at policy start and check for drift.
+        # Uses cached positions (zero CAN overhead) — never sync_read here,
+        # as that sends zero-torque probes and breaks holding torque.
+        self._log_follower_positions("policy start")
+        if self._post_preposition_positions and self._follower:
+            try:
+                bus = getattr(self._follower, "bus", None)
+                if bus and hasattr(bus, "read_cached_positions"):
+                    cached = bus.read_cached_positions()
+                    inversions = getattr(self._follower, "motor_inversions", None)
+                    if cached:
+                        for key, prev in self._post_preposition_positions.items():
+                            motor = key.removesuffix(".pos")
+                            current = cached.get(motor)
+                            if current is not None:
+                                if inversions and inversions.get(motor) and motor != "gripper":
+                                    current = -current
+                                if abs(current - prev) > 0.05:
+                                    logger.warning(
+                                        "DEPLOY DRIFT: %s moved %.4f rad during startup "
+                                        "(%.4f → %.4f)",
+                                        key, current - prev, prev, current,
+                                    )
+            except Exception:
+                pass
 
         # Capture the target speed_scale before warmup ramp modifies it
         target_speed_scale = (
@@ -519,11 +651,13 @@ class DeploymentRuntime:
                     and not k.endswith((".vel", ".tau"))
                 }
 
-                # 4a. Velocity ramp during warmup: start at 30% speed,
-                #     linearly increase to full speed over warmup period
+                # 4a. Velocity ramp during warmup: start at 70% speed,
+                #     linearly increase to full speed over warmup period.
+                #     70% gives the MIT controller enough velocity budget to
+                #     counteract gravity from frame 0 while limiting peak speed.
                 warmup = self._config.warmup_frames if self._config else 0
                 if warmup > 0 and self._frame_count < warmup:
-                    ramp = 0.3 + 0.7 * (self._frame_count / warmup)
+                    ramp = 0.7 + 0.3 * (self._frame_count / warmup)
                     self._safety_pipeline.update_speed_scale(
                         target_speed_scale * ramp
                     )
@@ -534,7 +668,22 @@ class DeploymentRuntime:
                     action, observation_positions, robot=self._follower, dt=dt
                 )
 
-                # 4b. Propagate safety-pipeline ESTOP to runtime state
+                # 4b. Safety pipeline diagnostics (first 5 frames + every 30th)
+                if self._frame_count < 5 or self._frame_count % 30 == 0:
+                    for _dk in ("link1.pos", "link2.pos"):
+                        _obs = observation_positions.get(_dk)
+                        _raw = action.get(_dk) if action else None
+                        _filt = filtered_action.get(_dk) if filtered_action else None
+                        if isinstance(_obs, (int, float)) and isinstance(_raw, (int, float)):
+                            logger.warning(
+                                "DEPLOY [frame %d] %s: obs=%.4f target=%.4f "
+                                "filtered=%.4f delta=%.4f",
+                                self._frame_count, _dk, _obs, _raw,
+                                _filt if _filt is not None else _raw,
+                                (_filt if _filt is not None else _raw) - _obs,
+                            )
+
+                # 4c. Propagate safety-pipeline ESTOP to runtime state
                 if self._safety_pipeline._estop and self._state != RuntimeState.ESTOP:
                     with self._state_lock:
                         self._state = RuntimeState.ESTOP
@@ -542,15 +691,12 @@ class DeploymentRuntime:
                         "Runtime ESTOP: safety pipeline triggered torque emergency stop"
                     )
 
-                # 4c. Warm-up blending: ramp from current position to
-                #     policy target over the first N frames to avoid jerks
-                if warmup > 0 and self._frame_count < warmup:
-                    blend_alpha = (self._frame_count + 1) / warmup
-                    for key in filtered_action:
-                        if key in observation_positions:
-                            current = observation_positions[key]
-                            target = filtered_action[key]
-                            filtered_action[key] = current + (target - current) * blend_alpha
+                # NOTE: Warmup position blending (previously step 4c) was removed.
+                # It reduced the MIT restoring force to ~7% on frame 0, which is
+                # far too weak to counteract gravity (~2-3 Nm on shoulder).
+                # Pre-positioning already places the arm at the correct starting
+                # position, and the safety pipeline velocity limiter + acceleration
+                # filter provide sufficient jerk protection.
 
                 # 5. Dry-run diagnostics or send to robot
                 if is_dry_run:
@@ -590,6 +736,14 @@ class DeploymentRuntime:
 
         logger.info("Control loop stopped")
 
+        # Clean up deployment log file handler
+        if hasattr(self, "_deploy_file_handler") and self._deploy_file_handler:
+            logging.getLogger("app.core.deployment").removeHandler(
+                self._deploy_file_handler
+            )
+            self._deploy_file_handler.close()
+            self._deploy_file_handler = None
+
     # ------------------------------------------------------------------
     # Action sources
     # ------------------------------------------------------------------
@@ -625,6 +779,38 @@ class DeploymentRuntime:
         policy_obs = self._obs_builder.prepare_observation(raw_obs)
         action_tensor = self._policy.select_action(policy_obs)
 
+        # Log full chunk trajectory ONCE per fresh inference (queue just refilled).
+        # Detect fresh inference: queue length jumped up (was draining, now full).
+        queue = getattr(self._policy, "_action_queue", None)
+        prev_qsize = getattr(self, "_prev_queue_size", 0)
+        qsize = len(queue) if queue is not None else 0
+        if queue is not None and qsize > prev_qsize and qsize > 30:
+            try:
+                import torch
+
+                action_names = self._obs_builder.get_training_action_names()
+                all_queued = torch.stack(list(queue))
+                if all_queued.ndim == 3:
+                    all_queued = all_queued[:, 0, :]
+                dim_labels = action_names or [
+                    f"dim{j}" for j in range(all_queued.shape[-1])
+                ]
+                ranges = {
+                    name: f"{all_queued[:, i].min():.4f}→{all_queued[:, i].max():.4f}"
+                    for i, name in enumerate(dim_labels)
+                    if i < all_queued.shape[-1]
+                }
+                logger.warning(
+                    "DEPLOY [chunk @ frame %d] fresh inference: %d queued steps. "
+                    "Normalized range: %s",
+                    self._frame_count,
+                    qsize,
+                    ranges,
+                )
+            except Exception:
+                pass
+        self._prev_queue_size = qsize
+
         movement_scale = 1.0
         if self._config:
             movement_scale = self._config.movement_scale
@@ -654,6 +840,12 @@ class DeploymentRuntime:
     def _get_observation(self) -> Optional[dict]:
         """Get observation from follower robot with lock.
 
+        Prefers get_observation_cached() to avoid zero-torque probes during
+        deployment. Damiao sync_read sends kp=0, kd=0 to each motor
+        sequentially, removing all holding torque for ~21ms per frame.
+        Cached observation uses the MIT response from the previous
+        sync_write — zero torque interruption.
+
         Merges motor positions from the follower with camera frames
         from CameraService (async_read, ZOH pattern).
         """
@@ -663,11 +855,18 @@ class DeploymentRuntime:
             return None
 
         try:
-            if self._robot_lock:
-                with self._robot_lock:
-                    obs = self._follower.get_observation()
+            if getattr(self, "_use_cached_obs", False):
+                if self._robot_lock:
+                    with self._robot_lock:
+                        obs = self._follower.get_observation_cached()
+                else:
+                    obs = self._follower.get_observation_cached()
             else:
-                obs = self._follower.get_observation()
+                if self._robot_lock:
+                    with self._robot_lock:
+                        obs = self._follower.get_observation()
+                else:
+                    obs = self._follower.get_observation()
         except Exception as e:
             logger.debug("Observation error: %s", e)
             return None
@@ -1240,7 +1439,18 @@ class DeploymentRuntime:
             with open(config_path) as f:
                 _policy_cfg = json.load(f)
 
-            policy_type = policy_info.policy_type
+            # Use config.json's "type" field as authoritative policy type.
+            # The directory-name-inferred policy_type can be wrong (e.g., "smolvla"
+            # when the actual type is "act") because the parser doesn't match
+            # complex directory names like "bearing_insertion_cell_v4_act_...".
+            policy_type = _policy_cfg.get("type", policy_info.policy_type)
+            if policy_type != policy_info.policy_type:
+                logger.warning(
+                    "DEPLOY: Policy type corrected: directory='%s' → config.json='%s'",
+                    policy_info.policy_type,
+                    policy_type,
+                )
+
             from lerobot.policies.factory import get_policy_class
 
             policy_cls = get_policy_class(policy_type)
@@ -1386,7 +1596,10 @@ class DeploymentRuntime:
             logger.warning("Failed to start recording session: %s", e)
 
     def _log_follower_positions(self, label: str) -> None:
-        """Log follower joint positions at WARNING level for diagnostics.
+        """Log follower joint positions from cache (zero CAN overhead).
+
+        Uses bus.read_cached_positions() instead of get_observation() to avoid
+        sync_read zero-torque probes that remove MIT holding torque.
 
         When label is "after pre-position", also stores a snapshot for
         drift detection at control loop start.
@@ -1394,6 +1607,27 @@ class DeploymentRuntime:
         if self._follower is None:
             return
         try:
+            # Prefer cached positions (zero CAN overhead, no torque interruption).
+            # The cache is populated by every sync_write (pre-position, policy).
+            bus = getattr(self._follower, "bus", None)
+            if bus and hasattr(bus, "read_cached_positions"):
+                raw_cached = bus.read_cached_positions()
+                if raw_cached:
+                    positions = dict(raw_cached)
+                    inversions = getattr(self._follower, "motor_inversions", None)
+                    if inversions:
+                        for motor, is_inverted in inversions.items():
+                            if is_inverted and motor in positions and motor != "gripper":
+                                positions[motor] = -positions[motor]
+                    raw_positions = {f"{k}.pos": v for k, v in positions.items()}
+                    display = {k: f"{v:+.4f}" for k, v in raw_positions.items()}
+                    logger.warning("DEPLOY [%s] follower positions: %s", label, display)
+                    if label == "after pre-position":
+                        self._post_preposition_positions = dict(raw_positions)
+                    return
+
+            # Fallback: no cache available (first call before any sync_write).
+            # Only used for "after enable" before pre-position has run.
             obs = self._follower.get_observation()
             raw_positions = {
                 k: v
@@ -1401,7 +1635,7 @@ class DeploymentRuntime:
                 if isinstance(v, (int, float)) and k.endswith(".pos")
             }
             display = {k: f"{v:+.4f}" for k, v in raw_positions.items()}
-            logger.warning("DEPLOY [%s] follower positions: %s", label, display)
+            logger.warning("DEPLOY [%s] follower positions (sync_read fallback): %s", label, display)
 
             if label == "after pre-position":
                 self._post_preposition_positions = dict(raw_positions)

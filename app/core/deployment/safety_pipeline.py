@@ -206,28 +206,53 @@ class SafetyPipeline:
         observation: Dict[str, float],
         dt: float,
     ) -> Dict[str, float]:
-        """Limit position change per frame to max_velocity * dt.
+        """Limit command trajectory velocity to max_velocity * dt.
 
-        This is *proper* velocity clamping — NOT the broken asymptotic
-        formula ``current + (target - current) * scale`` which never
-        reaches the target.
+        Uses the previous filtered output as the trajectory reference
+        (not the observation).  This limits how fast the COMMAND TARGET
+        moves between frames while allowing the position error
+        (target − observation) to grow naturally.
+
+        For MIT impedance motors this is critical: torque = kp × error,
+        so capping position error directly caps restoring torque.
+        Trajectory-based limiting lets torque build up to counteract
+        gravity and friction.
+
+        A per-motor max-position-error cap prevents unbounded torque
+        buildup when a motor is physically blocked.
         """
         result: Dict[str, float] = {}
         clamp_count = 0
 
         for motor, target in action.items():
-            current = observation.get(motor, target)
-            delta = target - current
+            # Trajectory reference: previous filtered output, falling
+            # back to observation on the very first frame.
+            prev = self._prev_output.get(
+                motor, observation.get(motor, target)
+            )
+            delta = target - prev
             max_delta = self._effective_max_velocity(motor) * dt
 
             if abs(delta) > max_delta:
                 clamped_delta = max_delta if delta > 0 else -max_delta
-                result[motor] = current + clamped_delta
+                filtered = prev + clamped_delta
                 clamp_count += 1
             else:
-                result[motor] = target
+                filtered = target
 
-            # Record velocity for readings
+            # Safety cap: limit max position error (filtered - obs)
+            # to prevent unbounded torque if motor is blocked.
+            obs_pos = observation.get(motor, filtered)
+            max_error = self._effective_max_position_error(motor)
+            error = filtered - obs_pos
+            if abs(error) > max_error:
+                filtered = obs_pos + max_error * (
+                    1.0 if error > 0 else -1.0
+                )
+
+            result[motor] = filtered
+
+            # Record trajectory velocity for readings
             self._readings.per_motor_velocity[motor] = (
                 abs(delta) / dt if dt > 0 else 0.0
             )
@@ -325,6 +350,13 @@ class SafetyPipeline:
         base_limit = DEFAULT_VELOCITY_LIMITS.get(model, FALLBACK_VELOCITY_LIMIT)
         scale = self._runtime_speed_scale if self._runtime_speed_scale is not None else self._config.speed_scale
         return base_limit * max(0.1, min(1.0, scale))
+
+    def _effective_max_position_error(self, motor_name: str) -> float:
+        """Max allowed position error (filtered − observation) for a motor."""
+        from .types import DEFAULT_MAX_POSITION_ERROR, FALLBACK_MAX_POSITION_ERROR
+
+        model = self._config.motor_models.get(motor_name, "")
+        return DEFAULT_MAX_POSITION_ERROR.get(model, FALLBACK_MAX_POSITION_ERROR)
 
     def _get_hold_output(
         self,

@@ -85,6 +85,7 @@ class DamiaoFollowerRobot(Robot):
 
     config_class = DamiaoFollowerConfig
     name = "damiao_follower"
+    _supports_cached_observation: bool = True
 
     def __init__(self, config: DamiaoFollowerConfig):
         super().__init__(config)
@@ -300,6 +301,60 @@ class DamiaoFollowerRobot(Robot):
             obs_dict[cam_key] = cam.async_read()
             dt_ms = (time.perf_counter() - start) * 1e3
             logger.debug(f"[DamiaoFollower] Read {cam_key}: {dt_ms:.1f}ms")
+
+        return obs_dict
+
+    def get_observation_cached(self) -> dict[str, Any]:
+        """Get observation from MIT response cache (zero CAN overhead).
+
+        Unlike get_observation() which does sync_read (sends zero-torque probes
+        kp=0, kd=0 to each motor), this reads positions/velocities/torques from
+        the cache populated by the previous sync_write. This means:
+        - No CAN reads → no torque interruption → arm maintains holding torque
+        - Observation is from the previous frame (one-frame latency, ~33ms)
+        - Suitable for deployment control loops where continuous torque is critical
+
+        Falls back to get_observation() if the cache is empty (first frame
+        before any sync_write has been sent).
+        """
+        if not self.is_connected:
+            raise DeviceNotConnectedError(f"{self} is not connected.")
+
+        # Check if cache is populated (sync_write must have been called at least once)
+        cached = self.bus.read_cached_positions()
+        if not cached:
+            return self.get_observation()
+
+        obs_dict = {}
+
+        # Positions from cache (same key format as get_observation)
+        for name, pos in cached.items():
+            if name == "gripper":
+                norm_pos = map_range(
+                    pos, self.gripper_open_pos, self.gripper_closed_pos, 0.0, 1.0
+                )
+                obs_dict[f"{name}.pos"] = norm_pos
+            else:
+                obs_dict[f"{name}.pos"] = pos
+
+        # Apply inversions (same as get_observation)
+        if self.motor_inversions:
+            for motor, is_inverted in self.motor_inversions.items():
+                key = f"{motor}.pos"
+                if is_inverted and key in obs_dict and motor != "gripper":
+                    obs_dict[key] = -obs_dict[key]
+
+        # Extended state from cache (zero CAN overhead)
+        if self.config.record_extended_state:
+            velocities = self.bus.read_cached_velocities()
+            torques = self.bus.read_torques()
+            for name in self._motor_names:
+                obs_dict[f"{name}.vel"] = velocities.get(name, 0.0)
+                obs_dict[f"{name}.tau"] = torques.get(name, 0.0)
+
+        # Camera images (same as get_observation)
+        for cam_key, cam in self.cameras.items():
+            obs_dict[cam_key] = cam.async_read()
 
         return obs_dict
 

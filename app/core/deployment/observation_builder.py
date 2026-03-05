@@ -134,9 +134,13 @@ class ObservationBuilder:
             if has_extended:
                 all_count = len(fallback)
                 fallback = [n for n in fallback if n.endswith(".pos")]
+                logger.warning(
+                    "DEPLOY: Action names derived from state names (backward compat). "
+                    "If this dataset was recorded with the split-cache fix, action names "
+                    "should be stored separately in info.json."
+                )
                 logger.info(
-                    "Action names not found; filtered %d extended state names "
-                    "to %d position-only",
+                    "Filtered %d extended state names to %d position-only",
                     all_count,
                     len(fallback),
                 )
@@ -412,9 +416,12 @@ class ObservationBuilder:
 
     def _warn_missing_states(self, state_names: list, raw_obs: dict) -> None:
         """One-time warning if training state names are missing from raw observation."""
+        if hasattr(self, "_warned_missing"):
+            return
+        self._warned_missing = True
+
         missing = [n for n in state_names if n not in raw_obs]
-        if missing and not hasattr(self, "_warned_missing"):
-            self._warned_missing = True
+        if missing:
             logger.warning(
                 "OBSERVATION MISMATCH: %d/%d state names missing from robot observation. "
                 "Missing: %s. These default to 0.0 — policy input will be degraded! "
@@ -423,6 +430,13 @@ class ObservationBuilder:
                 len(missing),
                 len(state_names),
                 missing[:8],
+            )
+        else:
+            logger.warning(
+                "DEPLOY [frame 0] observation: all %d states present. "
+                "Raw values: %s",
+                len(state_names),
+                {n: f"{float(raw_obs.get(n, 0.0)):.4f}" for n in state_names},
             )
 
     def convert_action_to_dict(
