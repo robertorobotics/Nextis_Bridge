@@ -316,6 +316,10 @@ class DeploymentRuntime:
         if self._loop_thread and self._loop_thread.is_alive():
             self._loop_thread.join(timeout=5.0)
 
+        # Return follower to leader position before cleanup
+        self._stop_event.clear()
+        self._pre_position_to_leader()
+
         # Cleanup
         if self._safety_pipeline:
             self._safety_pipeline.reset()
@@ -698,7 +702,7 @@ class DeploymentRuntime:
 
                 # 4b. Safety pipeline diagnostics (first 5 frames + every 30th)
                 if self._frame_count < 5 or self._frame_count % 30 == 0:
-                    for _dk in ("link1.pos", "link2.pos"):
+                    for _dk in ("link1.pos", "link2.pos", "gripper.pos"):
                         _obs = observation_positions.get(_dk)
                         _raw = action.get(_dk) if action else None
                         _filt = filtered_action.get(_dk) if filtered_action else None
@@ -1574,7 +1578,12 @@ class DeploymentRuntime:
             joint_limits = arm_def.config.get("joint_limits", {})
             for name, limits in joint_limits.items():
                 if isinstance(limits, (list, tuple)) and len(limits) == 2:
-                    safety.joint_limits[f"{name}.pos"] = tuple(limits)
+                    if name == "gripper":
+                        # Gripper actions/observations are in normalized 0-1 space
+                        # (mapped by DamiaoFollowerRobot), not radians like arm joints.
+                        safety.joint_limits[f"{name}.pos"] = (0.0, 1.0)
+                    else:
+                        safety.joint_limits[f"{name}.pos"] = tuple(limits)
 
         # Fallback: read per-motor type and joint limits directly from the
         # DamiaoFollowerRobot bus.  The bus knows each motor's exact type
@@ -1592,7 +1601,12 @@ class DeploymentRuntime:
                         safety.motor_models[key] = mcfg.motor_type
                     for name, (lo, hi) in bus._active_joint_limits.items():
                         key = f"{name}.pos"
-                        safety.joint_limits[key] = (lo, hi)
+                        if name == "gripper":
+                            # Gripper actions/observations are in normalized 0-1 space
+                            # (mapped by DamiaoFollowerRobot), not radians like arm joints.
+                            safety.joint_limits[key] = (0.0, 1.0)
+                        else:
+                            safety.joint_limits[key] = (lo, hi)
                     logger.warning(
                         "DEPLOY: Populated safety config from Damiao bus: "
                         "%d motor models, %d joint limits — %s",
